@@ -7,7 +7,24 @@ export type PeerInfo = {
 };
 
 function buildIceServers(): RTCIceServer[] {
-  const servers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+  const stunUrls: string[] = [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+    "stun:stun2.l.google.com:19302",
+    "stun:stun3.l.google.com:19302",
+    "stun:stun4.l.google.com:19302",
+    "stun:stun.ekiga.net",
+    "stun:stun.ideasip.com",
+    "stun:stun.rixtelecom.se",
+    "stun:stun.schlund.de",
+    "stun:stun.stunprotocol.org:3478",
+    "stun:stun.voiparound.com",
+    "stun:stun.voipbuster.com",
+    "stun:stun.voipstunt.com",
+    "stun:stun.voxgratia.org"
+  ];
+
+  const servers: RTCIceServer[] = [{ urls: stunUrls }];
 
   const urlsRaw = (import.meta as any).env?.VITE_TURN_URLS as string | undefined;
   const username = (import.meta as any).env?.VITE_TURN_USERNAME as string | undefined;
@@ -28,6 +45,7 @@ function buildIceServers(): RTCIceServer[] {
 export type PeerMediaEventHandlers = {
   onPeerConnected?: (peerId: string) => void;
   onPeerDisconnected?: (peerId: string) => void;
+  onPeerConnState?: (peerId: string, state: RTCPeerConnectionState, ice: RTCIceConnectionState) => void;
   onRemoteAudioTrack?: (peerId: string, track: MediaStreamTrack) => void;
   onRemoteVideoTrack?: (peerId: string, track: MediaStreamTrack) => void;
   onPeerVad?: (peerId: string, speaking: boolean) => void;
@@ -41,6 +59,7 @@ type PeerConn = {
   makingOffer: boolean;
   ignoreOffer: boolean;
   pendingIce: RTCIceCandidateInit[];
+  needsNegotiation: boolean;
 };
 
 export class PeerMesh {
@@ -75,15 +94,18 @@ export class PeerMesh {
 
   setLocalAudioTrack(track: MediaStreamTrack | null) {
     this.localAudioTrack = track;
-    for (const peer of this.peers.values()) {
+    for (const [peerId, peer] of this.peers) {
       this.upsertSender(peer.pc, "audio", track);
+      // Force renegotiation when tracks change (more reliable than waiting on negotiationneeded).
+      void this.negotiate(peerId);
     }
   }
 
   setLocalScreenTrack(track: MediaStreamTrack | null) {
     this.localScreenTrack = track;
-    for (const peer of this.peers.values()) {
+    for (const [peerId, peer] of this.peers) {
       this.upsertSender(peer.pc, "video", track);
+      void this.negotiate(peerId);
     }
   }
 
@@ -115,6 +137,11 @@ export class PeerMesh {
       if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
         // keep it simple: let higher layers decide retry; here just notify
       }
+      this.handlers.onPeerConnState?.(peer.peerId, pc.connectionState, pc.iceConnectionState);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      this.handlers.onPeerConnState?.(peer.peerId, pc.connectionState, pc.iceConnectionState);
     };
 
     pc.ontrack = (evt) => {
@@ -143,15 +170,26 @@ export class PeerMesh {
       polite: this.localPeerId.localeCompare(peer.peerId) < 0,
       makingOffer: false,
       ignoreOffer: false,
-      pendingIce: []
+      pendingIce: [],
+      needsNegotiation: false
     };
     this.peers.set(peer.peerId, conn);
+    this.handlers.onPeerConnState?.(peer.peerId, pc.connectionState, pc.iceConnectionState);
+
+    pc.onsignalingstatechange = () => {
+      if (pc.signalingState === "stable" && conn.needsNegotiation) {
+        conn.needsNegotiation = false;
+        void this.negotiate(peer.peerId);
+      }
+    };
 
     if (initiator) {
       const dc = pc.createDataChannel("ohmcord");
       conn.dc = dc;
       this.bindDataChannel(peer.peerId, dc);
-      // Initial negotiation will happen via onnegotiationneeded.
+      // Do not rely solely on onnegotiationneeded; some peers may miss it.
+      // Force initial offer for initiator peers.
+      void this.negotiate(peer.peerId);
     }
   }
 
@@ -185,6 +223,11 @@ export class PeerMesh {
     const conn = this.peers.get(peerId);
     if (!conn) return;
     const pc = conn.pc;
+    if (conn.makingOffer) return;
+    if (pc.signalingState !== "stable") {
+      conn.needsNegotiation = true;
+      return;
+    }
     try {
       conn.makingOffer = true;
       const offer = await pc.createOffer();
@@ -232,8 +275,16 @@ export class PeerMesh {
       const offerCollision = conn.makingOffer || pc.signalingState !== "stable";
       conn.ignoreOffer = !conn.polite && offerCollision;
       if (conn.ignoreOffer) return;
-
-      await pc.setRemoteDescription(description);
+      try {
+        if (offerCollision && conn.polite) {
+          // Perfect-negotiation rollback path for polite peer.
+          await Promise.all([pc.setLocalDescription({ type: "rollback" }), pc.setRemoteDescription(description)]);
+        } else {
+          await pc.setRemoteDescription(description);
+        }
+      } catch {
+        return;
+      }
 
       // Flush any queued ICE
       if (conn.pendingIce.length) {
@@ -247,16 +298,24 @@ export class PeerMesh {
         conn.pendingIce = [];
       }
 
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      this.signaling.send({ type: "answer", to: msg.from, sdp: pc.localDescription?.sdp ?? "" });
+      try {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        this.signaling.send({ type: "answer", to: msg.from, sdp: pc.localDescription?.sdp ?? "" });
+      } catch {
+        // ignore
+      }
       return;
     }
 
     if (msg.type === "answer") {
       const conn = this.peers.get(msg.from);
       if (!conn) return;
-      await conn.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+      try {
+        await conn.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+      } catch {
+        // ignore
+      }
       return;
     }
 

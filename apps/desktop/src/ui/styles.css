@@ -36,7 +36,7 @@ select {
 .layout {
   height: 100vh;
   display: grid;
-  grid-template-columns: 280px 1fr 340px;
+  grid-template-columns: 260px 1fr 360px;
   gap: 12px;
   padding: 12px;
 }
@@ -97,6 +97,14 @@ select {
   background: #243244;
   border-color: #2f4566;
 }
+.btnIcon {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 10px;
+}
 .btnDanger {
   background: #3b1e28;
   border-color: #5b2536;
@@ -120,6 +128,55 @@ select {
   border-radius: 999px;
   background: var(--panel2);
   font-size: 12px;
+}
+
+.sidebar .panelBody {
+  padding: 10px;
+}
+
+.roomList {
+  display: grid;
+  gap: 8px;
+  overflow: auto;
+  max-height: 280px;
+  padding-right: 4px;
+}
+
+.roomItem {
+  width: 100%;
+  text-align: left;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.roomItem:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.06);
+}
+.roomItemActive {
+  background: rgba(110, 231, 183, 0.08);
+  border-color: rgba(110, 231, 183, 0.22);
+}
+.roomName {
+  font-weight: 650;
+}
+
+.connTag {
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.signalBadge {
+  margin-top: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
 }
 
 .chat {

@@ -58,6 +58,9 @@ export async function startVoicePipeline(opts: {
     void ctx.close();
   };
 
-  return { track: processedTrack, stop };
+  // Send raw mic track for reliability. Keep worklet for VAD/speaking signal only.
+  // This avoids silent-audio regressions caused by worklet output issues.
+  void processedTrack;
+  return { track: micTrack, stop };
 }
 
