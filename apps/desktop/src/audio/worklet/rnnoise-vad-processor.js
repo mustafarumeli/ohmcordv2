@@ -1,0 +1,145 @@
+import { createRNNWasmModuleSync } from "@jitsi/rnnoise-wasm";
+
+// RNNoise expects 480 samples per frame @ 48kHz (10ms).
+const FRAME_SIZE = 480;
+const HANGOVER_FRAMES = 25; // ~250ms
+
+class RNNoiseVadProcessor extends AudioWorkletProcessor {
+  module = null;
+  statePtr = 0;
+  inPtr = 0;
+  outPtr = 0;
+
+  config = { enabled: true, vadThreshold: 0.6 };
+
+  frame = new Float32Array(FRAME_SIZE);
+  framePos = 0;
+
+  outBuf = new Float32Array(FRAME_SIZE * 8);
+  outRead = 0;
+  outWrite = 0;
+  outSize = 0;
+
+  hangover = 0;
+  speaking = false;
+
+  constructor() {
+    super();
+
+    this.port.onmessage = (evt) => {
+      const msg = evt.data;
+      if (msg?.type === "config") {
+        if (typeof msg.enabled === "boolean") this.config.enabled = msg.enabled;
+        if (typeof msg.vadThreshold === "number") this.config.vadThreshold = msg.vadThreshold;
+      }
+      if (msg?.type === "stop") this.cleanup();
+    };
+
+    // Lazy init: create module synchronously, then await runtime ready.
+    try {
+      const m = createRNNWasmModuleSync();
+      Promise.resolve(m.ready).then((readyModule) => {
+        this.module = readyModule;
+        this.initRnnoise();
+      });
+    } catch {
+      this.module = null;
+    }
+  }
+
+  initRnnoise() {
+    if (!this.module) return;
+    try {
+      if (typeof this.module._rnnoise_init === "function") this.module._rnnoise_init();
+      this.statePtr = this.module._rnnoise_create();
+      this.inPtr = this.module._malloc(FRAME_SIZE * 4);
+      this.outPtr = this.module._malloc(FRAME_SIZE * 4);
+    } catch {
+      this.cleanup();
+    }
+  }
+
+  cleanup() {
+    if (!this.module) return;
+    try {
+      if (this.statePtr) this.module._rnnoise_destroy(this.statePtr);
+    } catch {}
+    try {
+      if (this.inPtr) this.module._free(this.inPtr);
+      if (this.outPtr) this.module._free(this.outPtr);
+    } catch {}
+    this.statePtr = 0;
+    this.inPtr = 0;
+    this.outPtr = 0;
+  }
+
+  pushOut(samples) {
+    for (let i = 0; i < samples.length; i++) {
+      this.outBuf[this.outWrite] = samples[i];
+      this.outWrite = (this.outWrite + 1) % this.outBuf.length;
+      if (this.outSize < this.outBuf.length) this.outSize++;
+      else this.outRead = (this.outRead + 1) % this.outBuf.length;
+    }
+  }
+
+  popOut() {
+    if (this.outSize === 0) return null;
+    const v = this.outBuf[this.outRead];
+    this.outRead = (this.outRead + 1) % this.outBuf.length;
+    this.outSize--;
+    return v;
+  }
+
+  processFrame() {
+    if (!this.module || !this.statePtr || !this.inPtr || !this.outPtr) {
+      this.pushOut(this.frame);
+      return;
+    }
+
+    this.module.HEAPF32.set(this.frame, this.inPtr >> 2);
+    let vadProb = 0;
+    try {
+      vadProb = this.module._rnnoise_process_frame(this.statePtr, this.outPtr, this.inPtr);
+    } catch {
+      this.pushOut(this.frame);
+      return;
+    }
+
+    const outView = this.module.HEAPF32.subarray(this.outPtr >> 2, (this.outPtr >> 2) + FRAME_SIZE);
+    this.pushOut(this.config.enabled ? outView : this.frame);
+
+    if (vadProb >= this.config.vadThreshold) this.hangover = HANGOVER_FRAMES;
+    else this.hangover = Math.max(0, this.hangover - 1);
+
+    const nextSpeaking = this.hangover > 0;
+    if (nextSpeaking !== this.speaking) {
+      this.speaking = nextSpeaking;
+      this.port.postMessage({ type: "speaking", speaking: this.speaking });
+    }
+  }
+
+  process(inputs, outputs) {
+    const input = inputs[0]?.[0];
+    const output = outputs[0]?.[0];
+    if (!output) return true;
+    if (!input) {
+      output.fill(0);
+      return true;
+    }
+
+    for (let i = 0; i < output.length; i++) {
+      const s = input[i] ?? 0;
+      this.frame[this.framePos++] = s;
+      if (this.framePos === FRAME_SIZE) {
+        this.processFrame();
+        this.framePos = 0;
+      }
+      const o = this.popOut();
+      output[i] = o ?? s;
+    }
+    return true;
+  }
+}
+
+registerProcessor("rnnoise-vad-processor", RNNoiseVadProcessor);
+
