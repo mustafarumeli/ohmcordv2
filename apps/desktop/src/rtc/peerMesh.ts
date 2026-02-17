@@ -6,6 +6,25 @@ export type PeerInfo = {
   displayName: string;
 };
 
+function buildIceServers(): RTCIceServer[] {
+  const servers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+
+  const urlsRaw = (import.meta as any).env?.VITE_TURN_URLS as string | undefined;
+  const username = (import.meta as any).env?.VITE_TURN_USERNAME as string | undefined;
+  const credential = (import.meta as any).env?.VITE_TURN_CREDENTIAL as string | undefined;
+
+  const urls = (urlsRaw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (urls.length && username && credential) {
+    servers.push({ urls, username, credential });
+  }
+
+  return servers;
+}
+
 export type PeerMediaEventHandlers = {
   onPeerConnected?: (peerId: string) => void;
   onPeerDisconnected?: (peerId: string) => void;
@@ -79,7 +98,7 @@ export class PeerMesh {
     if (this.peers.has(peer.peerId)) return;
 
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+      iceServers: buildIceServers()
     });
 
     pc.onicecandidate = (evt) => {
