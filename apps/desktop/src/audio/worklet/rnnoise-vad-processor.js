@@ -3,6 +3,7 @@ import { createRNNWasmModuleSync } from "@jitsi/rnnoise-wasm";
 // RNNoise expects 480 samples per frame @ 48kHz (10ms).
 const FRAME_SIZE = 480;
 const HANGOVER_FRAMES = 25; // ~250ms
+const RMS_VAD_THRESHOLD = 0.01; // normalized float RMS
 
 class RNNoiseVadProcessor extends AudioWorkletProcessor {
   module = null;
@@ -91,6 +92,14 @@ class RNNoiseVadProcessor extends AudioWorkletProcessor {
   }
 
   processFrame() {
+    // Compute RMS for fallback VAD.
+    let sum = 0;
+    for (let i = 0; i < this.frame.length; i++) {
+      const v = this.frame[i];
+      sum += v * v;
+    }
+    const rmsIn = Math.sqrt(sum / this.frame.length);
+
     if (!this.module || !this.statePtr || !this.inPtr || !this.outPtr) {
       this.pushOut(this.frame);
       return;
@@ -108,7 +117,11 @@ class RNNoiseVadProcessor extends AudioWorkletProcessor {
     const outView = this.module.HEAPF32.subarray(this.outPtr >> 2, (this.outPtr >> 2) + FRAME_SIZE);
     this.pushOut(this.config.enabled ? outView : this.frame);
 
-    if (vadProb >= this.config.vadThreshold) this.hangover = HANGOVER_FRAMES;
+    // RNNoise VAD probability appears to be stuck at 0 in some environments.
+    // Fall back to RMS-based VAD for speaking detection.
+    const speechByProb = vadProb >= this.config.vadThreshold;
+    const speechByRms = rmsIn >= RMS_VAD_THRESHOLD;
+    if (speechByProb || speechByRms) this.hangover = HANGOVER_FRAMES;
     else this.hangover = Math.max(0, this.hangover - 1);
 
     const nextSpeaking = this.hangover > 0;

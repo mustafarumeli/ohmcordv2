@@ -1,48 +1,32 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { SignalingClient } from "../net/signalingClient";
-import type { PeerSummary, ServerToClient } from "../shared/protocol";
-import { PeerMesh } from "../rtc/peerMesh";
-import { VoiceRing } from "./components/VoiceRing";
-import { startVoicePipeline } from "../audio/voicePipeline";
 import {
-  addDoc,
   collection,
+  doc,
+  getDoc,
+  getDocs,
   limit,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
+  setDoc,
   type Timestamp
 } from "firebase/firestore";
-import { displayNameFromUid, ensureAnonUser, getFirebaseDb } from "./firebase";
-
-type ChatMessage = {
-  roomId: string;
-  channelId: string;
-  uid: string;
-  fromName: string;
-  ts: number;
-  message: string;
-};
-
-type Participant = PeerSummary & {
-  speaking: boolean;
-  connState?: RTCPeerConnectionState;
-  iceState?: RTCIceConnectionState;
-};
+import { startVoicePipeline } from "../audio/voicePipeline";
+import { SignalingClient } from "../net/signalingClient";
+import { PeerMesh } from "../rtc/peerMesh";
+import type { PeerSummary, ServerToClient } from "../shared/protocol";
+import { ensureAnonUser, getFirebaseDb, displayNameFromUid } from "./firebase";
+import { ChannelList, type ChannelSummary } from "./components/ChannelList";
+import { ChatPanel } from "./components/ChatPanel";
+import { Onboarding } from "./components/Onboarding";
+import { VoicePanel, type Participant } from "./components/VoicePanel";
+import { RemoteAudioRack } from "./components/RemoteAudioRack";
+import { BottomBar } from "./components/BottomBar";
 
 type PeerConnSummary = {
   connState: RTCPeerConnectionState;
   iceState: RTCIceConnectionState;
-};
-
-const DEFAULT_CHANNEL_ID = "general";
-const SIGNALING_URL = (import.meta.env.VITE_SIGNALING_URL as string | undefined) ?? "ws://localhost:8787";
-
-type RoomSummary = {
-  id: string;
-  name: string;
-  createdAtMs: number;
 };
 
 type SignalKind = "offer" | "answer" | "ice";
@@ -53,6 +37,8 @@ type SignalingCounters = {
 };
 
 const EMPTY_SIGNAL_COUNTER: SignalCounter = { offer: 0, answer: 0, ice: 0 };
+
+const SIGNALING_URL = (import.meta.env.VITE_SIGNALING_URL as string | undefined) ?? "ws://localhost:8080";
 
 function friendlyFirebaseError(e: unknown): string {
   const code =
@@ -81,28 +67,33 @@ function friendlyFirebaseError(e: unknown): string {
 export function App() {
   const [uid, setUid] = useState<string | null>(null);
   const [displayName, setDisplayName] = useState<string>("...");
-  const [rooms, setRooms] = useState<RoomSummary[]>([]);
-  const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
-  const [createRoomOpen, setCreateRoomOpen] = useState(false);
-  const [createRoomName, setCreateRoomName] = useState("");
+  const [needsOnboarding, setNeedsOnboarding] = useState(false);
 
-  const [channelId, setChannelId] = useState(DEFAULT_CHANNEL_ID);
+  const [channels, setChannels] = useState<ChannelSummary[]>([]);
+  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
+  const [activePanel, setActivePanel] = useState<"text" | "voice">("text");
+  const selectedChannel = useMemo(() => channels.find((c) => c.id === selectedChannelId) ?? null, [channels, selectedChannelId]);
 
   const [wsOpen, setWsOpen] = useState(false);
   const [localPeerId, setLocalPeerId] = useState<string | null>(null);
-  const [joinedRoomId, setJoinedRoomId] = useState<string | null>(null);
+  const [joinedVoiceKey, setJoinedVoiceKey] = useState<string | null>(null);
 
   const [participants, setParticipants] = useState<Map<string, Participant>>(() => new Map());
-  const [chat, setChat] = useState<ChatMessage[]>([]);
-  const [draft, setDraft] = useState("");
 
   const [voiceOn, setVoiceOn] = useState(false);
+  const [deafened, setDeafened] = useState(false);
   const [rnnoiseOn, setRnnoiseOn] = useState(true);
   const [localSpeaking, setLocalSpeaking] = useState(false);
   const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
   const [micDeviceId, setMicDeviceId] = useState<string>("default");
   const [speakerDevices, setSpeakerDevices] = useState<MediaDeviceInfo[]>([]);
   const [speakerDeviceId, setSpeakerDeviceId] = useState<string>("default");
+  const [inputVolume, setInputVolume] = useState(1);
+  const [outputVolume, setOutputVolume] = useState(1);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [createChannelOpen, setCreateChannelOpen] = useState(false);
+  const [createChannelName, setCreateChannelName] = useState("");
+  const [createChannelType, setCreateChannelType] = useState<"text" | "voice">("text");
   const [lastError, setLastError] = useState<string | null>(null);
 
   const [screenOn, setScreenOn] = useState(false);
@@ -122,29 +113,20 @@ export function App() {
   const loopbackStopRef = useRef<(() => void) | null>(null);
   const loopbackAudioRef = useRef<HTMLAudioElement | null>(null);
   const localPeerIdRef = useRef<string | null>(null);
+  const joinedVoiceKeyRef = useRef<string | null>(null);
   const displayNameRef = useRef<string>(displayName);
   const localSpeakingRef = useRef<boolean>(localSpeaking);
-
-  const canJoin = wsOpen && Boolean(localPeerId) && Boolean(uid) && Boolean(selectedRoomId);
-  const canLeave = Boolean(joinedRoomId);
-  const selectedRoomName = useMemo(() => {
-    const id = joinedRoomId ?? selectedRoomId;
-    if (!id) return null;
-    return rooms.find((r) => r.id === id)?.name ?? id;
-  }, [joinedRoomId, rooms, selectedRoomId]);
-
-  const sortedParticipants = useMemo(() => {
-    const arr = [...participants.values()];
-    arr.sort((a, b) => a.displayName.localeCompare(b.displayName));
-    return arr;
-  }, [participants]);
+  const localAudioTrackRef = useRef<MediaStreamTrack | null>(null);
+  const setInputGainRef = useRef<((v: number) => void) | null>(null);
 
   const sortedParticipantsWithConn = useMemo(() => {
-    return sortedParticipants.map((p) => {
+    const arr = [...participants.values()];
+    arr.sort((a, b) => a.displayName.localeCompare(b.displayName));
+    return arr.map((p) => {
       const s = peerConnStates.get(p.peerId);
       return s ? { ...p, connState: s.connState, iceState: s.iceState } : p;
     });
-  }, [peerConnStates, sortedParticipants]);
+  }, [participants, peerConnStates]);
 
   useEffect(() => {
     let mounted = true;
@@ -173,9 +155,7 @@ export function App() {
       onClose: () => {
         setWsOpen(false);
         setLocalPeerId(null);
-        setJoinedRoomId(null);
-        meshRef.current?.closeAll();
-        meshRef.current = null;
+        disconnectVoice();
       },
       onSend: (msg) => {
         if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
@@ -215,6 +195,10 @@ export function App() {
   }, [localPeerId]);
 
   useEffect(() => {
+    joinedVoiceKeyRef.current = joinedVoiceKey;
+  }, [joinedVoiceKey]);
+
+  useEffect(() => {
     displayNameRef.current = displayName;
   }, [displayName]);
 
@@ -229,7 +213,14 @@ export function App() {
         const user = await ensureAnonUser();
         if (cancelled) return;
         setUid(user.uid);
-        setDisplayName(displayNameFromUid(user.uid));
+        const stored = window.localStorage.getItem("ohmcord.displayName");
+        if (stored && stored.trim()) {
+          setDisplayName(stored.trim());
+          setNeedsOnboarding(false);
+        } else {
+          setDisplayName(displayNameFromUid(user.uid));
+          setNeedsOnboarding(true);
+        }
       } catch (e) {
         if (cancelled) return;
         setLastError(friendlyFirebaseError(e));
@@ -241,26 +232,34 @@ export function App() {
     };
   }, []);
 
+  // Settings from localStorage
   useEffect(() => {
+    const vIn = Number(window.localStorage.getItem("ohmcord.settings.inputVolume") ?? "1");
+    const vOut = Number(window.localStorage.getItem("ohmcord.settings.outputVolume") ?? "1");
+    const rn = window.localStorage.getItem("ohmcord.settings.rnnoiseOn");
+    if (Number.isFinite(vIn)) setInputVolume(Math.max(0, Math.min(2, vIn)));
+    if (Number.isFinite(vOut)) setOutputVolume(Math.max(0, Math.min(1, vOut)));
+    if (rn === "0") setRnnoiseOn(false);
+  }, []);
+
+  // Root channels list
+  useEffect(() => {
+    setChannels([]);
+    setSelectedChannelId(null);
+    setActivePanel("text");
+
     try {
       const db = getFirebaseDb();
-      const q = query(collection(db, "rooms"), orderBy("createdAt", "desc"), limit(200));
+      const q = query(collection(db, "channels"), orderBy("createdAt", "desc"), limit(500));
       const unsub = onSnapshot(
         q,
         (snap) => {
-          const next: RoomSummary[] = snap.docs.map((d) => {
-            const data = d.data() as { name?: string; createdAt?: Timestamp };
-            return {
-              id: d.id,
-              name: data.name ?? d.id,
-              createdAtMs: data.createdAt ? data.createdAt.toMillis() : 0
-            };
+          const next: ChannelSummary[] = snap.docs.map((d) => {
+            const data = d.data() as { name?: string; type?: unknown };
+            const t = data.type === "voice" ? "voice" : "text";
+            return { id: d.id, name: data.name ?? d.id, type: t };
           });
-          setRooms(next);
-          setSelectedRoomId((prev) => {
-            if (prev && next.some((r) => r.id === prev)) return prev;
-            return next[0]?.id ?? null;
-          });
+          setChannels(next);
         },
         (err) => setLastError(friendlyFirebaseError(err))
       );
@@ -271,6 +270,39 @@ export function App() {
     }
   }, []);
 
+  // Ensure defaults exist (best effort)
+  const ensuredDefaultsRef = useRef(false);
+  useEffect(() => {
+    async function ensureDefaults() {
+      if (!uid) return;
+      if (ensuredDefaultsRef.current) return;
+      ensuredDefaultsRef.current = true;
+      try {
+        const db = getFirebaseDb();
+        const colRef = collection(db, "channels");
+        const existing = await getDocs(query(colRef, limit(1)));
+        if (!existing.empty) return;
+        await Promise.all([
+          setDoc(doc(colRef, "sema-sozleri"), { name: "sema-sozleri", type: "text", createdAt: serverTimestamp(), createdBy: uid }),
+          setDoc(doc(colRef, "voice"), { name: "voice", type: "voice", createdAt: serverTimestamp(), createdBy: uid })
+        ]);
+      } catch {
+        // ignore
+      }
+    }
+    void ensureDefaults();
+  }, [uid]);
+
+  // Default selection
+  useEffect(() => {
+    if (channels.length === 0) return;
+    setSelectedChannelId((prev) => {
+      if (prev && channels.some((c) => c.id === prev)) return prev;
+      const firstText = channels.find((c) => c.type === "text")?.id ?? channels[0]?.id ?? null;
+      return firstText;
+    });
+  }, [channels]);
+
   function handleServerMessage(msg: ServerToClient) {
     if (msg.type === "welcome") {
       setLocalPeerId(msg.peerId);
@@ -278,7 +310,7 @@ export function App() {
     }
 
     if (msg.type === "peers") {
-      setJoinedRoomId(msg.roomId);
+      setJoinedVoiceKey(msg.roomId);
       setParticipants((prev) => {
         const next = new Map(prev);
         // ensure local is present
@@ -360,9 +392,16 @@ export function App() {
 
   function ensureMesh(room: string) {
     const myPeerId = localPeerIdRef.current;
-    if (meshRef.current || !myPeerId) return;
+    if (!myPeerId) return;
     const signaling = signalingRef.current;
     if (!signaling) return;
+
+    const existing = meshRef.current as (PeerMesh & { __roomId?: string }) | null;
+    if (existing && existing.__roomId === room) return;
+    if (existing && existing.__roomId !== room) {
+      existing.closeAll();
+      meshRef.current = null;
+    }
 
     const mesh = new PeerMesh({
       signaling,
@@ -401,40 +440,45 @@ export function App() {
       }
     });
 
+    (mesh as any).__roomId = room;
     meshRef.current = mesh;
+    if (localAudioTrackRef.current) mesh.setLocalAudioTrack(localAudioTrackRef.current);
+    if (screenOn && localScreenStream) {
+      const track = localScreenStream.getVideoTracks()[0] ?? null;
+      if (track) mesh.setLocalScreenTrack(track);
+    }
   }
 
-  async function join() {
+  function joinVoiceChannel(channelId: string) {
     const signaling = signalingRef.current;
     if (!signaling) return;
     const myPeerId = localPeerIdRef.current;
     if (!myPeerId) return;
-    if (!uid) return;
-    if (!selectedRoomId) return;
 
-    // reset
-    setChat([]);
-    setRemoteAudioStreams(new Map());
-    setRemoteVideoStreams(new Map());
-    setPeerConnStates(new Map());
+    const key = channelId;
+    if (joinedVoiceKeyRef.current === key) return;
+
+    // switch: leave old voice room first
+    if (joinedVoiceKeyRef.current) signaling.send({ type: "leave" });
+    cleanupVoiceState();
+
     setSignalingCounters({
       sent: { ...EMPTY_SIGNAL_COUNTER },
       recv: { ...EMPTY_SIGNAL_COUNTER }
     });
-
     setParticipants(() => {
       const m = new Map<string, Participant>();
-      m.set(myPeerId, { peerId: myPeerId, displayName, speaking: localSpeakingRef.current });
+      m.set(myPeerId, { peerId: myPeerId, displayName: displayNameRef.current, speaking: localSpeakingRef.current });
       return m;
     });
 
-    signaling.send({ type: "join", roomId: selectedRoomId, user: { displayName } });
+    ensureMesh(key);
+    signaling.send({ type: "join", roomId: key, user: { displayName: displayNameRef.current } });
     void unlockAudioPlayback();
   }
 
-  function leave() {
-    signalingRef.current?.send({ type: "leave" });
-    setJoinedRoomId(null);
+  function cleanupVoiceState() {
+    setJoinedVoiceKey(null);
     meshRef.current?.closeAll();
     meshRef.current = null;
     stopLoopbackTest();
@@ -444,16 +488,23 @@ export function App() {
     setPeerConnStates(new Map());
   }
 
+  function disconnectVoice() {
+    signalingRef.current?.send({ type: "leave" });
+    stopVoice();
+    cleanupVoiceState();
+  }
+
   async function startVoice() {
-    if (!joinedRoomId || !localPeerId) return;
+    if (!joinedVoiceKey || !localPeerId) return;
     if (voiceOn) return;
 
     setLastError(null);
     try {
       void unlockAudioPlayback();
-      const { track, stop } = await startVoicePipeline({
+      const { track, stop, setInputGain } = await startVoicePipeline({
         rnnoiseOn,
         deviceId: micDeviceId,
+        inputGain: inputVolume,
         onSpeaking: (speaking) => {
           setLocalSpeaking(speaking);
           setParticipants((prev) => {
@@ -464,12 +515,15 @@ export function App() {
           });
           // best-effort: via data channel + via server
           meshRef.current?.broadcastVad(speaking);
-          signalingRef.current?.send({ type: "vad", roomId: joinedRoomId, speaking });
+          const key = joinedVoiceKeyRef.current;
+          if (key) signalingRef.current?.send({ type: "vad", roomId: key, speaking });
         }
       });
 
       voiceStopRef.current = stop;
+      setInputGainRef.current = setInputGain;
       setVoiceOn(true);
+      localAudioTrackRef.current = track;
       meshRef.current?.setLocalAudioTrack(track);
     } catch (e) {
       setLastError(e instanceof Error ? e.message : "Failed to start microphone");
@@ -480,7 +534,9 @@ export function App() {
     if (!voiceOn) return;
     voiceStopRef.current?.();
     voiceStopRef.current = null;
+    setInputGainRef.current = null;
     setVoiceOn(false);
+    localAudioTrackRef.current = null;
     meshRef.current?.setLocalAudioTrack(null);
     setLocalSpeaking(false);
   }
@@ -522,7 +578,7 @@ export function App() {
   }
 
   async function startScreenShare() {
-    if (!joinedRoomId) return;
+    if (!joinedVoiceKey) return;
     if (screenOn) return;
     setLastError(null);
     try {
@@ -545,25 +601,6 @@ export function App() {
     setLocalScreenStream(null);
   }
 
-  async function sendMessage() {
-    if (!joinedRoomId) return;
-    if (!uid) return;
-    const text = draft.trim();
-    if (!text) return;
-    setDraft("");
-    try {
-      const db = getFirebaseDb();
-      await addDoc(collection(db, "rooms", joinedRoomId, "channels", channelId, "messages"), {
-        uid,
-        fromName: displayName,
-        message: text,
-        ts: serverTimestamp()
-      });
-    } catch (e) {
-      setLastError(friendlyFirebaseError(e));
-    }
-  }
-
   async function unlockAudioPlayback() {
     try {
       const list = Array.from(document.querySelectorAll("audio"));
@@ -574,8 +611,8 @@ export function App() {
             if (speakerDeviceId !== "default" && typeof sinkAudio.setSinkId === "function") {
               await sinkAudio.setSinkId(speakerDeviceId);
             }
-            el.muted = false;
-            el.volume = 1;
+            el.muted = deafened;
+            el.volume = outputVolume;
             await el.play();
           } catch {
             // ignore; per-element errors are surfaced in ParticipantRow too
@@ -600,76 +637,117 @@ export function App() {
               setLastError(e instanceof Error ? e.message : "Failed to switch speaker output");
             }
           }
+          el.muted = deafened;
+          el.volume = outputVolume;
         })
       );
     }
     void applySpeaker();
-  }, [speakerDeviceId]);
+  }, [speakerDeviceId, outputVolume, deafened]);
+
+  // Auto-start mic when joining a voice room.
+  useEffect(() => {
+    if (!joinedVoiceKey) return;
+    if (voiceOn) return;
+    void startVoice();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joinedVoiceKey]);
 
   useEffect(() => {
-    if (!joinedRoomId) {
-      setChat([]);
-      return;
-    }
-    try {
-      const db = getFirebaseDb();
-      const q = query(
-        collection(db, "rooms", joinedRoomId, "channels", channelId, "messages"),
-        orderBy("ts", "asc"),
-        limit(200)
-      );
-      const unsub = onSnapshot(
-        q,
-        (snap) => {
-          const msgs: ChatMessage[] = snap.docs.map((d) => {
-            const data = d.data() as { uid?: string; fromName?: string; message?: string; ts?: Timestamp };
-            return {
-              roomId: joinedRoomId,
-              channelId,
-              uid: data.uid ?? "unknown",
-              fromName: data.fromName ?? "Unknown",
-              message: data.message ?? "",
-              ts: data.ts ? data.ts.toMillis() : 0
-            };
-          });
-          setChat(msgs);
-        },
-      (err) => setLastError(friendlyFirebaseError(err))
-      );
-      return () => unsub();
-    } catch (e) {
-      setLastError(friendlyFirebaseError(e));
-      return;
-    }
-  }, [joinedRoomId, channelId]);
+    // chat history is handled by ChatPanel (Firestore + pagination)
+  }, []);
 
-  async function createRoom() {
+  useEffect(() => {
+    window.localStorage.setItem("ohmcord.settings.inputVolume", String(inputVolume));
+    if (voiceOn) setInputGainRef.current?.(inputVolume);
+  }, [inputVolume, voiceOn]);
+  useEffect(() => {
+    window.localStorage.setItem("ohmcord.settings.outputVolume", String(outputVolume));
+  }, [outputVolume]);
+  useEffect(() => {
+    window.localStorage.setItem("ohmcord.settings.rnnoiseOn", rnnoiseOn ? "1" : "0");
+    if (voiceOn) {
+      // apply on next start by restarting; keep simple and predictable
+      stopVoice();
+      void startVoice();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rnnoiseOn]);
+
+  useEffect(() => {
+    if (!voiceOn) return;
+    if (!joinedVoiceKey) return;
+    // Switching input device requires restarting the pipeline.
+    stopVoice();
+    void startVoice();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [micDeviceId]);
+
+  function slugify(name: string): string {
+    const map: Record<string, string> = { "ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u" };
+    const lowered = name
+      .trim()
+      .toLowerCase()
+      .split("")
+      .map((ch) => map[ch] ?? ch)
+      .join("");
+    const slug = lowered
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48);
+    return slug || "channel";
+  }
+
+  async function createChannel() {
     if (!uid) return;
-    const name = createRoomName.trim();
+    const name = createChannelName.trim();
     if (!name) return;
-    setCreateRoomName("");
-    setCreateRoomOpen(false);
+    setCreateChannelOpen(false);
+    setCreateChannelName("");
     try {
       const db = getFirebaseDb();
-      const docRef = await addDoc(collection(db, "rooms"), {
+      const base = slugify(name);
+      let id = base;
+      for (let i = 0; i < 20; i++) {
+        const ref = doc(db, "channels", id);
+        const exists = await getDoc(ref);
+        if (!exists.exists()) break;
+        id = `${base}-${i + 2}`;
+      }
+      await setDoc(doc(db, "channels", id), {
         name,
+        type: createChannelType,
         createdAt: serverTimestamp(),
-        createdBy: uid,
-        lastActiveAt: serverTimestamp()
+        createdBy: uid
       });
-      setSelectedRoomId(docRef.id);
+      setSelectedChannelId(id);
+      setActivePanel(createChannelType === "voice" ? "voice" : "text");
+      if (createChannelType === "voice") joinVoiceChannel(id);
     } catch (e) {
       setLastError(friendlyFirebaseError(e));
     }
   }
 
+  const canUseVoiceActions = Boolean(joinedVoiceKey);
+
   return (
     <div className="layout">
+      {needsOnboarding ? (
+        <Onboarding
+          initialName={displayName}
+          onSubmit={(name) => {
+            window.localStorage.setItem("ohmcord.displayName", name);
+            setDisplayName(name);
+            setNeedsOnboarding(false);
+          }}
+        />
+      ) : null}
+
       <div className="panel sidebar">
         <div className="panelHeader">
           <div>
             <div style={{ fontWeight: 700 }}>Ohmcord</div>
-            <div className="muted">Electron + WebRTC (≤4)</div>
+            <div className="muted">Channels</div>
           </div>
           <span className="pill">
             <span
@@ -686,55 +764,52 @@ export function App() {
         </div>
         <div className="panelBody">
           <div className="stack" style={{ gap: 12 }}>
-            <div className="stack" style={{ gap: 10 }}>
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <div className="muted">Rooms</div>
-                <button className="btn btnPrimary btnIcon" onClick={() => setCreateRoomOpen((v) => !v)} disabled={!uid}>
-                  +
-                </button>
-              </div>
-              {createRoomOpen ? (
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <div className="muted">Channels</div>
+              <button className="btn btnPrimary btnIcon" onClick={() => setCreateChannelOpen((v) => !v)} disabled={!uid}>
+                +
+              </button>
+            </div>
+
+            {createChannelOpen ? (
+              <div className="stack">
+                <input
+                  className="input"
+                  value={createChannelName}
+                  placeholder="New channel name"
+                  onChange={(e) => setCreateChannelName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void createChannel();
+                    if (e.key === "Escape") setCreateChannelOpen(false);
+                  }}
+                />
                 <div className="row">
-                  <input
-                    className="input"
-                    value={createRoomName}
-                    placeholder="New room name"
-                    onChange={(e) => setCreateRoomName(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void createRoom();
-                      if (e.key === "Escape") setCreateRoomOpen(false);
-                    }}
-                  />
-                  <button className="btn btnPrimary" onClick={() => void createRoom()} disabled={!createRoomName.trim()}>
+                  <select className="input" value={createChannelType} onChange={(e) => setCreateChannelType(e.target.value as "text" | "voice")}>
+                    <option value="text">text</option>
+                    <option value="voice">voice</option>
+                  </select>
+                  <button className="btn btnPrimary" onClick={() => void createChannel()} disabled={!createChannelName.trim()}>
                     Create
                   </button>
                 </div>
-              ) : null}
-              <div className="roomList">
-                {rooms.length === 0 ? <div className="muted">No rooms yet</div> : null}
-                {rooms.map((r) => (
-                  <button
-                    key={r.id}
-                    className={`roomItem ${selectedRoomId === r.id ? "roomItemActive" : ""}`}
-                    onClick={() => setSelectedRoomId(r.id)}
-                    title={r.id}
-                  >
-                    <div className="roomName">{r.name}</div>
-                    <div className="muted" style={{ fontSize: 11 }}>
-                      {r.id.slice(0, 8)}
-                    </div>
-                  </button>
-                ))}
               </div>
-            </div>
+            ) : null}
 
-            <div className="row">
-              <button className="btn btnPrimary" onClick={() => void join()} disabled={!canJoin || Boolean(joinedRoomId)}>
-                Join
-              </button>
-              <button className="btn btnDanger" onClick={leave} disabled={!canLeave}>
-                Leave
-              </button>
+            <div className="panel" style={{ background: "transparent", border: "none" }}>
+              <ChannelList
+                channels={channels}
+                selectedChannelId={selectedChannelId}
+                disabled={!uid}
+                joinedVoiceKey={joinedVoiceKey}
+                participants={sortedParticipantsWithConn.map((p) => ({ peerId: p.peerId, displayName: p.displayName, speaking: p.speaking }))}
+                onSelect={(id) => {
+                  setSelectedChannelId(id);
+                  const c = channels.find((x) => x.id === id);
+                  const t = c?.type ?? "text";
+                  setActivePanel(t === "voice" ? "voice" : "text");
+                  if (t === "voice") joinVoiceChannel(id);
+                }}
+              />
             </div>
 
             {lastError ? (
@@ -752,243 +827,81 @@ export function App() {
               </div>
             ) : null}
 
-            <div className="stack">
-              <div className="muted">Voice</div>
-              <label className="row">
-                <input type="checkbox" checked={rnnoiseOn} onChange={(e) => setRnnoiseOn(e.target.checked)} />
-                <span>RNNoise (AudioWorklet)</span>
-              </label>
-              <div className="stack">
-                <div className="muted">Microphone</div>
-                <select
-                  className="input"
-                  value={micDeviceId}
-                  onChange={(e) => setMicDeviceId(e.target.value)}
-                  disabled={voiceOn}
-                >
-                  <option value="default">Default</option>
-                  {micDevices.map((d) => (
-                    <option key={d.deviceId} value={d.deviceId}>
-                      {d.label || `Mic ${d.deviceId.slice(0, 8)}`}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="stack">
-                <div className="muted">Speaker</div>
-                <select className="input" value={speakerDeviceId} onChange={(e) => setSpeakerDeviceId(e.target.value)}>
-                  <option value="default">Default</option>
-                  {speakerDevices.map((d) => (
-                    <option key={d.deviceId} value={d.deviceId}>
-                      {d.label || `Speaker ${d.deviceId.slice(0, 8)}`}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="row">
-                <button className="btn btnPrimary" onClick={startVoice} disabled={!joinedRoomId || voiceOn}>
-                  Start voice
-                </button>
-                <button className="btn" onClick={stopVoice} disabled={!voiceOn}>
-                  Stop
-                </button>
-              </div>
-              <div className="row">
-                <button className="btn" onClick={() => void startLoopbackTest()} disabled={loopbackOn}>
-                  Loopback test
-                </button>
-                <button className="btn" onClick={stopLoopbackTest} disabled={!loopbackOn}>
-                  Stop test
-                </button>
-              </div>
-            </div>
-
-            <div className="stack">
-              <div className="muted">Screen share</div>
-              <div className="row">
-                <button className="btn btnPrimary" onClick={startScreenShare} disabled={!joinedRoomId || screenOn}>
-                  Start share
-                </button>
-                <button className="btn" onClick={stopScreenShare} disabled={!screenOn}>
-                  Stop
-                </button>
-              </div>
-            </div>
-
-            <div className="muted">
-              Local peerId: <code>{localPeerId ?? "(waiting)"}</code>
-            </div>
-            <div className="muted">
-              Joined: <code>{joinedRoomId ?? "(not in room)"}</code>
-            </div>
             <div className="muted">
               You: <code>{displayName}</code>
             </div>
-            <audio ref={loopbackAudioRef} autoPlay playsInline />
           </div>
         </div>
       </div>
 
-      <div className="panel">
-        <div className="panelHeader">
-          <div>
-            <div style={{ fontWeight: 700 }}>#{channelId}</div>
-            <div className="muted">{selectedRoomName ? selectedRoomName : "Select a room"}</div>
-          </div>
-          <select className="input" style={{ width: 160 }} value={channelId} onChange={(e) => setChannelId(e.target.value)}>
-            <option value="general">general</option>
-            <option value="games">games</option>
-            <option value="music">music</option>
-          </select>
-        </div>
-        <div className="chat">
-          <div className="chatLog">
-            {chat
-              .filter((m) => m.channelId === channelId && m.roomId === joinedRoomId)
-              .map((m, idx) => (
-                <div className="msg" key={`${m.ts}-${idx}`}>
-                  <div className="msgMeta">
-                    <div className="msgAuthor">{m.fromName}</div>
-                    <div className="msgTs">{new Date(m.ts).toLocaleTimeString()}</div>
-                  </div>
-                  <div className="msgText">{m.message}</div>
-                </div>
-              ))}
-          </div>
-          <div className="chatComposer">
-            <input
-              className="input"
-              value={draft}
-              placeholder={joinedRoomId ? "Message..." : "Join a room to chat"}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void sendMessage();
-              }}
-              disabled={!joinedRoomId}
-            />
-            <button className="btn btnPrimary" onClick={() => void sendMessage()} disabled={!joinedRoomId}>
-              Send
-            </button>
-          </div>
-        </div>
-      </div>
+      {activePanel === "voice" ? (
+        <VoicePanel
+          voiceChannelId={selectedChannel?.type === "voice" ? selectedChannel.name : null}
+          wsOpen={wsOpen}
+          joinedVoiceKey={joinedVoiceKey}
+          localPeerId={localPeerId}
+          localSpeaking={localSpeaking}
+          signalingCounters={signalingCounters}
+          speakerDeviceId={speakerDeviceId}
+          outputVolume={outputVolume}
+          onStartScreenShare={() => void startScreenShare()}
+          onStopScreenShare={stopScreenShare}
+          screenOn={screenOn}
+          localScreenStream={localScreenStream}
+          remoteVideoStreams={remoteVideoStreams}
+          onPlaybackBlocked={() =>
+            setLastError(
+              "Remote audio stream arrived but playback was blocked by the browser. Click the voice channel again or Start voice to unlock audio output."
+            )
+          }
+        />
+      ) : (
+        <ChatPanel
+          channelId={selectedChannel?.type === "text" ? selectedChannelId : null}
+          uid={uid}
+          displayName={displayName}
+          disabled={needsOnboarding}
+          onError={(msg) => setLastError(msg)}
+        />
+      )}
 
-      <div className="panel">
-        <div className="panelHeader">
-          <div>
-            <div style={{ fontWeight: 700 }}>Voice</div>
-            <div className="muted">Participants + VAD ring</div>
-            <div className="signalBadge muted">
-              tx o/a/i: {signalingCounters.sent.offer}/{signalingCounters.sent.answer}/{signalingCounters.sent.ice} | rx o/a/i:{" "}
-              {signalingCounters.recv.offer}/{signalingCounters.recv.answer}/{signalingCounters.recv.ice}
-            </div>
-          </div>
-          <span className="pill">
-            <VoiceRing speaking={localSpeaking} /> you
-          </span>
-        </div>
-        <div className="panelBody">
-          <div className="participants">
-            {sortedParticipantsWithConn.map((p) => (
-              <ParticipantRow
-                key={p.peerId}
-                p={p}
-                audioStream={remoteAudioStreams.get(p.peerId) ?? null}
-                speakerDeviceId={speakerDeviceId}
-                onPlaybackBlocked={() =>
-                  setLastError(
-                    "Remote audio stream arrived but playback was blocked by the browser. Click Join/Start voice again to unlock audio output."
-                  )
-                }
-              />
-            ))}
-          </div>
+      <RemoteAudioRack
+        streams={remoteAudioStreams}
+        speakerDeviceId={speakerDeviceId}
+        volume={outputVolume}
+        deafened={deafened}
+        onPlaybackBlocked={() =>
+          setLastError(
+            "Remote audio stream arrived but playback was blocked by the browser. Click the voice channel again or Start voice to unlock audio output."
+          )
+        }
+      />
 
-          <div style={{ height: 12 }} />
-
-          <div className="stack">
-            <div className="muted">Screens</div>
-            <div className="videoGrid">
-              {localScreenStream ? (
-                <VideoTile label="You (local)" stream={localScreenStream} />
-              ) : (
-                <div className="muted">No local share</div>
-              )}
-              {[...remoteVideoStreams.entries()].map(([peerId, stream]) => (
-                <VideoTile key={peerId} label={`Remote: ${participants.get(peerId)?.displayName ?? peerId}`} stream={stream} />
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ParticipantRow(props: {
-  p: Participant;
-  audioStream: MediaStream | null;
-  speakerDeviceId: string;
-  onPlaybackBlocked?: () => void;
-}) {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-
-  useEffect(() => {
-    if (!audioRef.current) return;
-    audioRef.current.srcObject = props.audioStream;
-    const sinkAudio = audioRef.current as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
-    audioRef.current.muted = false;
-    audioRef.current.volume = 1;
-    if (props.speakerDeviceId !== "default" && typeof sinkAudio.setSinkId === "function") {
-      void sinkAudio.setSinkId(props.speakerDeviceId).catch(() => props.onPlaybackBlocked?.());
-    }
-    if (props.audioStream) {
-      // Chromium may block autoplay; best-effort start.
-      void audioRef.current.play().catch(() => props.onPlaybackBlocked?.());
-    }
-  }, [props.audioStream, props.onPlaybackBlocked, props.speakerDeviceId]);
-
-  return (
-    <div className="participant">
-      <div className="row" style={{ gap: 10 }}>
-        <VoiceRing speaking={props.p.speaking} />
-        <div>
-          <div style={{ fontWeight: 600 }}>{props.p.displayName}</div>
-          <div className="row" style={{ gap: 8, marginTop: 2 }}>
-            <div className="muted" style={{ fontSize: 11 }}>
-              {props.p.peerId.slice(0, 8)}
-            </div>
-            {props.p.connState ? <span className="connTag">pc:{props.p.connState}</span> : null}
-            {props.p.iceState ? <span className="connTag">ice:{props.p.iceState}</span> : null}
-            {props.audioStream ? <span className="connTag">audio</span> : null}
-          </div>
-        </div>
-      </div>
-      <audio
-        ref={audioRef}
-        autoPlay
-        playsInline
-        onCanPlay={() => {
-          if (!audioRef.current) return;
-          void audioRef.current.play().catch(() => props.onPlaybackBlocked?.());
-        }}
+      <BottomBar
+        displayName={displayName}
+        joinedVoiceKey={joinedVoiceKey}
+        voiceOn={voiceOn}
+        deafened={deafened}
+        canUseVoiceActions={canUseVoiceActions}
+        settingsOpen={settingsOpen}
+        onToggleSettings={() => setSettingsOpen((v) => !v)}
+        onCloseSettings={() => setSettingsOpen(false)}
+        onToggleMic={() => (voiceOn ? stopVoice() : void startVoice())}
+        onToggleDeafen={() => setDeafened((v) => !v)}
+        onDisconnectVoice={disconnectVoice}
+        rnnoiseOn={rnnoiseOn}
+        setRnnoiseOn={setRnnoiseOn}
+        micDevices={micDevices}
+        micDeviceId={micDeviceId}
+        setMicDeviceId={setMicDeviceId}
+        speakerDevices={speakerDevices}
+        speakerDeviceId={speakerDeviceId}
+        setSpeakerDeviceId={setSpeakerDeviceId}
+        inputVolume={inputVolume}
+        setInputVolume={setInputVolume}
+        outputVolume={outputVolume}
+        setOutputVolume={setOutputVolume}
       />
     </div>
   );
 }
-
-function VideoTile(props: { label: string; stream: MediaStream }) {
-  const ref = useRef<HTMLVideoElement | null>(null);
-  useEffect(() => {
-    if (!ref.current) return;
-    ref.current.srcObject = props.stream;
-  }, [props.stream]);
-
-  return (
-    <div className="stack" style={{ gap: 6 }}>
-      <div className="muted">{props.label}</div>
-      <video className="video" ref={ref} autoPlay playsInline muted />
-    </div>
-  );
-}
-

@@ -24,8 +24,6 @@ function buildIceServers(): RTCIceServer[] {
     "stun:stun.voxgratia.org"
   ];
 
-  const servers: RTCIceServer[] = [{ urls: stunUrls }];
-
   const urlsRaw = (import.meta as any).env?.VITE_TURN_URLS as string | undefined;
   const username = (import.meta as any).env?.VITE_TURN_USERNAME as string | undefined;
   const credential = (import.meta as any).env?.VITE_TURN_CREDENTIAL as string | undefined;
@@ -35,11 +33,12 @@ function buildIceServers(): RTCIceServer[] {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  if (urls.length && username && credential) {
-    servers.push({ urls, username, credential });
+  // If TURN is configured, use only TURN (no STUN fallback).
+  if (urls.length > 0 && username && credential) {
+    return [{ urls, username, credential }];
   }
 
-  return servers;
+  return [{ urls: stunUrls }];
 }
 
 export type PeerMediaEventHandlers = {
