@@ -489,6 +489,10 @@ export function App() {
       sent: { ...EMPTY_SIGNAL_COUNTER },
       recv: { ...EMPTY_SIGNAL_COUNTER }
     });
+    // Mark joined locally right away so voice controls are enabled
+    // while waiting for server "peers" payload.
+    setJoinedVoiceKey(key);
+    joinedVoiceKeyRef.current = key;
     setParticipants(() => {
       const m = new Map<string, Participant>();
       m.set(myPeerId, { peerId: myPeerId, displayName: displayNameRef.current, speaking: localSpeakingRef.current });

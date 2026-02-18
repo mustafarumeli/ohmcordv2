@@ -8,20 +8,7 @@ export type PeerInfo = {
 
 function buildIceServers(): RTCIceServer[] {
   const stunUrls: string[] = [
-    "stun:stun.l.google.com:19302",
-    "stun:stun1.l.google.com:19302",
-    "stun:stun2.l.google.com:19302",
-    "stun:stun3.l.google.com:19302",
-    "stun:stun4.l.google.com:19302",
-    "stun:stun.ekiga.net",
-    "stun:stun.ideasip.com",
-    "stun:stun.rixtelecom.se",
-    "stun:stun.schlund.de",
-    "stun:stun.stunprotocol.org:3478",
-    "stun:stun.voiparound.com",
-    "stun:stun.voipbuster.com",
-    "stun:stun.voipstunt.com",
-    "stun:stun.voxgratia.org"
+    "stun:72.61.177.239:3478"
   ];
 
   const urlsRaw = (import.meta as any).env?.VITE_TURN_URLS as string | undefined;
@@ -50,18 +37,18 @@ export type PeerMediaEventHandlers = {
   onPeerVad?: (peerId: string, speaking: boolean) => void;
 };
 
-type SenderSlot = "micAudio" | "screenAudio" | "screenVideo";
-
 type PeerConn = {
   pc: RTCPeerConnection;
   dc?: RTCDataChannel;
+  micAudioSender?: RTCRtpSender;
+  screenAudioSender?: RTCRtpSender;
+  screenVideoSender?: RTCRtpSender;
   displayName: string;
   polite: boolean;
   makingOffer: boolean;
   ignoreOffer: boolean;
   pendingIce: RTCIceCandidateInit[];
   needsNegotiation: boolean;
-  senders: Partial<Record<SenderSlot, RTCRtpSender>>;
 };
 
 export class PeerMesh {
@@ -99,9 +86,19 @@ export class PeerMesh {
   setLocalAudioTrack(track: MediaStreamTrack | null) {
     this.localAudioTrack = track;
     for (const [peerId, peer] of this.peers) {
-      this.upsertSender(peer, "micAudio", track, null);
-      // Force renegotiation when tracks change (more reliable than waiting on negotiationneeded).
-      void this.negotiate(peerId);
+      const needsOffer = this.syncMicAudioSender(peer);
+      if (needsOffer) void this.negotiate(peerId);
+    }
+  }
+
+  setLocalScreenTrack(track: MediaStreamTrack | null) {
+    this.localScreenStream = null;
+    this.localScreenTrack = track;
+    this.localScreenAudioTrack = null;
+    for (const [peerId, peer] of this.peers) {
+      const videoChanged = this.syncScreenVideoSender(peer);
+      const audioChanged = this.syncScreenAudioSender(peer);
+      if (videoChanged || audioChanged) void this.negotiate(peerId);
     }
   }
 
@@ -110,9 +107,9 @@ export class PeerMesh {
     this.localScreenTrack = stream?.getVideoTracks()[0] ?? null;
     this.localScreenAudioTrack = stream?.getAudioTracks()[0] ?? null;
     for (const [peerId, peer] of this.peers) {
-      this.upsertSender(peer, "screenVideo", this.localScreenTrack, this.localScreenStream);
-      this.upsertSender(peer, "screenAudio", this.localScreenAudioTrack, this.localScreenStream);
-      void this.negotiate(peerId);
+      const videoChanged = this.syncScreenVideoSender(peer);
+      const audioChanged = this.syncScreenAudioSender(peer);
+      if (videoChanged || audioChanged) void this.negotiate(peerId);
     }
   }
 
@@ -123,7 +120,7 @@ export class PeerMesh {
     }
   }
 
-  ensurePeer(peer: PeerInfo, initiator: boolean) {
+  ensurePeer(peer: PeerInfo) {
     if (this.peers.has(peer.peerId)) return;
 
     const pc = new RTCPeerConnection({
@@ -135,9 +132,9 @@ export class PeerMesh {
       this.signaling.send({ type: "ice", to: peer.peerId, candidate: evt.candidate.toJSON() });
     };
 
-    pc.onnegotiationneeded = async () => {
-      await this.negotiate(peer.peerId);
-    };
+    // Avoid negotiation storms from noisy browser negotiationneeded events.
+    // We negotiate explicitly when local sender topology changes.
+    pc.onnegotiationneeded = null;
 
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "connected") this.handlers.onPeerConnected?.(peer.peerId);
@@ -152,13 +149,10 @@ export class PeerMesh {
     };
 
     pc.ontrack = (evt) => {
-      const [stream] = evt.streams;
+      const stream = evt.streams[0] ?? new MediaStream([evt.track]);
       const track = evt.track;
-      const remoteStream = stream ?? new MediaStream([track]);
-      if (track.kind === "audio") this.handlers.onRemoteAudioTrack?.(peer.peerId, track, remoteStream);
-      if (track.kind === "video") this.handlers.onRemoteVideoTrack?.(peer.peerId, track, remoteStream);
-      // ensure tracks stop cleanup is handled by consumer
-      void remoteStream;
+      if (track.kind === "audio") this.handlers.onRemoteAudioTrack?.(peer.peerId, track, stream);
+      if (track.kind === "video") this.handlers.onRemoteVideoTrack?.(peer.peerId, track, stream);
     };
 
     pc.ondatachannel = (evt) => {
@@ -175,15 +169,12 @@ export class PeerMesh {
       makingOffer: false,
       ignoreOffer: false,
       pendingIce: [],
-      needsNegotiation: false,
-      senders: {}
+      needsNegotiation: false
     };
-    // add local tracks if available
-    this.upsertSender(conn, "micAudio", this.localAudioTrack, null);
-    this.upsertSender(conn, "screenVideo", this.localScreenTrack, this.localScreenStream);
-    this.upsertSender(conn, "screenAudio", this.localScreenAudioTrack, this.localScreenStream);
-
     this.peers.set(peer.peerId, conn);
+    this.syncMicAudioSender(conn);
+    this.syncScreenAudioSender(conn);
+    this.syncScreenVideoSender(conn);
     this.handlers.onPeerConnState?.(peer.peerId, pc.connectionState, pc.iceConnectionState);
 
     pc.onsignalingstatechange = () => {
@@ -193,12 +184,13 @@ export class PeerMesh {
       }
     };
 
-    if (initiator) {
+    // Deterministic initiator per pair prevents glare in multi-join races.
+    const shouldInitiate = this.localPeerId.localeCompare(peer.peerId) < 0;
+    if (shouldInitiate) {
       const dc = pc.createDataChannel("ohmcord");
       conn.dc = dc;
       this.bindDataChannel(peer.peerId, dc);
-      // Do not rely solely on onnegotiationneeded; some peers may miss it.
-      // Force initial offer for initiator peers.
+      // Force initial offer for the designated initiator.
       void this.negotiate(peer.peerId);
     }
   }
@@ -216,20 +208,64 @@ export class PeerMesh {
     };
   }
 
-  private upsertSender(peer: PeerConn, slot: SenderSlot, track: MediaStreamTrack | null, stream: MediaStream | null) {
-    const sender = peer.senders[slot];
-    if (!track) {
-      if (sender) {
-        peer.pc.removeTrack(sender);
-        peer.senders[slot] = undefined;
+  private syncMicAudioSender(conn: PeerConn): boolean {
+    if (!this.localAudioTrack) {
+      if (conn.micAudioSender) {
+        conn.pc.removeTrack(conn.micAudioSender);
+        conn.micAudioSender = undefined;
+        return true;
       }
-      return;
+      return false;
     }
-    if (sender) {
-      void sender.replaceTrack(track);
-      return;
+    if (conn.micAudioSender) {
+      if (conn.micAudioSender.track?.id !== this.localAudioTrack.id) {
+        void conn.micAudioSender.replaceTrack(this.localAudioTrack);
+      }
+      return false;
     }
-    peer.senders[slot] = peer.pc.addTrack(track, stream ?? new MediaStream([track]));
+    conn.micAudioSender = conn.pc.addTrack(this.localAudioTrack, new MediaStream([this.localAudioTrack]));
+    return true;
+  }
+
+  private syncScreenAudioSender(conn: PeerConn): boolean {
+    if (!this.localScreenAudioTrack) {
+      if (conn.screenAudioSender) {
+        conn.pc.removeTrack(conn.screenAudioSender);
+        conn.screenAudioSender = undefined;
+        return true;
+      }
+      return false;
+    }
+    if (conn.screenAudioSender) {
+      if (conn.screenAudioSender.track?.id !== this.localScreenAudioTrack.id) {
+        void conn.screenAudioSender.replaceTrack(this.localScreenAudioTrack);
+      }
+      return false;
+    }
+    conn.screenAudioSender = conn.pc.addTrack(
+      this.localScreenAudioTrack,
+      this.localScreenStream ?? new MediaStream([this.localScreenAudioTrack])
+    );
+    return true;
+  }
+
+  private syncScreenVideoSender(conn: PeerConn): boolean {
+    if (!this.localScreenTrack) {
+      if (conn.screenVideoSender) {
+        conn.pc.removeTrack(conn.screenVideoSender);
+        conn.screenVideoSender = undefined;
+        return true;
+      }
+      return false;
+    }
+    if (conn.screenVideoSender) {
+      if (conn.screenVideoSender.track?.id !== this.localScreenTrack.id) {
+        void conn.screenVideoSender.replaceTrack(this.localScreenTrack);
+      }
+      return false;
+    }
+    conn.screenVideoSender = conn.pc.addTrack(this.localScreenTrack, this.localScreenStream ?? new MediaStream([this.localScreenTrack]));
+    return true;
   }
 
   private async negotiate(peerId: string) {
@@ -256,15 +292,13 @@ export class PeerMesh {
   async handleSignaling(msg: ServerToClient) {
     if (msg.type === "peers") {
       for (const peer of msg.peers) {
-        // joiner initiates offers to existing peers
-        this.ensurePeer(peer, true);
+        this.ensurePeer(peer);
       }
       return;
     }
 
     if (msg.type === "peer-joined") {
-      // new peer will initiate, but create RTCPeerConnection ready to accept offer
-      this.ensurePeer(msg.peer, false);
+      this.ensurePeer(msg.peer);
       return;
     }
 
@@ -280,7 +314,7 @@ export class PeerMesh {
     }
 
     if (msg.type === "offer") {
-      this.ensurePeer({ peerId: msg.from, displayName: msg.from }, false);
+      this.ensurePeer({ peerId: msg.from, displayName: msg.from });
       const conn = this.peers.get(msg.from);
       if (!conn) return;
       const pc = conn.pc;
