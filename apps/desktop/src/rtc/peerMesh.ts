@@ -45,10 +45,12 @@ export type PeerMediaEventHandlers = {
   onPeerConnected?: (peerId: string) => void;
   onPeerDisconnected?: (peerId: string) => void;
   onPeerConnState?: (peerId: string, state: RTCPeerConnectionState, ice: RTCIceConnectionState) => void;
-  onRemoteAudioTrack?: (peerId: string, track: MediaStreamTrack) => void;
-  onRemoteVideoTrack?: (peerId: string, track: MediaStreamTrack) => void;
+  onRemoteAudioTrack?: (peerId: string, track: MediaStreamTrack, stream: MediaStream) => void;
+  onRemoteVideoTrack?: (peerId: string, track: MediaStreamTrack, stream: MediaStream) => void;
   onPeerVad?: (peerId: string, speaking: boolean) => void;
 };
+
+type SenderSlot = "micAudio" | "screenAudio" | "screenVideo";
 
 type PeerConn = {
   pc: RTCPeerConnection;
@@ -59,6 +61,7 @@ type PeerConn = {
   ignoreOffer: boolean;
   pendingIce: RTCIceCandidateInit[];
   needsNegotiation: boolean;
+  senders: Partial<Record<SenderSlot, RTCRtpSender>>;
 };
 
 export class PeerMesh {
@@ -69,6 +72,8 @@ export class PeerMesh {
   private handlers: PeerMediaEventHandlers;
   private localAudioTrack: MediaStreamTrack | null = null;
   private localScreenTrack: MediaStreamTrack | null = null;
+  private localScreenAudioTrack: MediaStreamTrack | null = null;
+  private localScreenStream: MediaStream | null = null;
 
   constructor(opts: {
     signaling: SignalingClient;
@@ -94,16 +99,19 @@ export class PeerMesh {
   setLocalAudioTrack(track: MediaStreamTrack | null) {
     this.localAudioTrack = track;
     for (const [peerId, peer] of this.peers) {
-      this.upsertSender(peer.pc, "audio", track);
+      this.upsertSender(peer, "micAudio", track, null);
       // Force renegotiation when tracks change (more reliable than waiting on negotiationneeded).
       void this.negotiate(peerId);
     }
   }
 
-  setLocalScreenTrack(track: MediaStreamTrack | null) {
-    this.localScreenTrack = track;
+  setLocalScreenMedia(stream: MediaStream | null) {
+    this.localScreenStream = stream;
+    this.localScreenTrack = stream?.getVideoTracks()[0] ?? null;
+    this.localScreenAudioTrack = stream?.getAudioTracks()[0] ?? null;
     for (const [peerId, peer] of this.peers) {
-      this.upsertSender(peer.pc, "video", track);
+      this.upsertSender(peer, "screenVideo", this.localScreenTrack, this.localScreenStream);
+      this.upsertSender(peer, "screenAudio", this.localScreenAudioTrack, this.localScreenStream);
       void this.negotiate(peerId);
     }
   }
@@ -146,10 +154,11 @@ export class PeerMesh {
     pc.ontrack = (evt) => {
       const [stream] = evt.streams;
       const track = evt.track;
-      if (track.kind === "audio") this.handlers.onRemoteAudioTrack?.(peer.peerId, track);
-      if (track.kind === "video") this.handlers.onRemoteVideoTrack?.(peer.peerId, track);
+      const remoteStream = stream ?? new MediaStream([track]);
+      if (track.kind === "audio") this.handlers.onRemoteAudioTrack?.(peer.peerId, track, remoteStream);
+      if (track.kind === "video") this.handlers.onRemoteVideoTrack?.(peer.peerId, track, remoteStream);
       // ensure tracks stop cleanup is handled by consumer
-      void stream;
+      void remoteStream;
     };
 
     pc.ondatachannel = (evt) => {
@@ -159,10 +168,6 @@ export class PeerMesh {
       if (conn) conn.dc = dc;
     };
 
-    // add local tracks if available
-    this.upsertSender(pc, "audio", this.localAudioTrack);
-    this.upsertSender(pc, "video", this.localScreenTrack);
-
     const conn: PeerConn = {
       pc,
       displayName: peer.displayName,
@@ -170,8 +175,14 @@ export class PeerMesh {
       makingOffer: false,
       ignoreOffer: false,
       pendingIce: [],
-      needsNegotiation: false
+      needsNegotiation: false,
+      senders: {}
     };
+    // add local tracks if available
+    this.upsertSender(conn, "micAudio", this.localAudioTrack, null);
+    this.upsertSender(conn, "screenVideo", this.localScreenTrack, this.localScreenStream);
+    this.upsertSender(conn, "screenAudio", this.localScreenAudioTrack, this.localScreenStream);
+
     this.peers.set(peer.peerId, conn);
     this.handlers.onPeerConnState?.(peer.peerId, pc.connectionState, pc.iceConnectionState);
 
@@ -205,17 +216,20 @@ export class PeerMesh {
     };
   }
 
-  private upsertSender(pc: RTCPeerConnection, kind: "audio" | "video", track: MediaStreamTrack | null) {
-    const sender = pc.getSenders().find((s) => s.track?.kind === kind);
+  private upsertSender(peer: PeerConn, slot: SenderSlot, track: MediaStreamTrack | null, stream: MediaStream | null) {
+    const sender = peer.senders[slot];
     if (!track) {
-      if (sender) pc.removeTrack(sender);
+      if (sender) {
+        peer.pc.removeTrack(sender);
+        peer.senders[slot] = undefined;
+      }
       return;
     }
     if (sender) {
       void sender.replaceTrack(track);
       return;
     }
-    pc.addTrack(track, new MediaStream([track]));
+    peer.senders[slot] = peer.pc.addTrack(track, stream ?? new MediaStream([track]));
   }
 
   private async negotiate(peerId: string) {

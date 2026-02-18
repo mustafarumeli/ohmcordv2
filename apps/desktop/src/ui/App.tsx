@@ -91,6 +91,8 @@ export function App() {
   const [inputVolume, setInputVolume] = useState(1);
   const [outputVolume, setOutputVolume] = useState(1);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [shareAudioMuted, setShareAudioMuted] = useState(true);
+  const [shareAudioVolume, setShareAudioVolume] = useState(1);
   const [createChannelOpen, setCreateChannelOpen] = useState(false);
   const [createChannelName, setCreateChannelName] = useState("");
   const [createChannelType, setCreateChannelType] = useState<"text" | "voice">("text");
@@ -416,17 +418,38 @@ export function App() {
             return next;
           });
         },
-        onRemoteAudioTrack: (peerId, track) => {
+        onRemoteAudioTrack: (peerId, track, stream) => {
+          // If an audio track belongs to a stream that also has video, treat it as screen-share media.
+          if (stream.getVideoTracks().length > 0) {
+            setRemoteVideoStreams((prev) => {
+              const next = new Map(prev);
+              next.set(peerId, stream);
+              return next;
+            });
+            return;
+          }
           setRemoteAudioStreams((prev) => {
             const next = new Map(prev);
             next.set(peerId, new MediaStream([track]));
             return next;
           });
         },
-        onRemoteVideoTrack: (peerId, track) => {
+        onRemoteVideoTrack: (peerId, track, stream) => {
+          const clearPeerVideoIfCurrentTrack = () => {
+            setRemoteVideoStreams((prev) => {
+              const currentTrack = prev.get(peerId)?.getVideoTracks()[0];
+              if (!currentTrack || currentTrack.id !== track.id) return prev;
+              const next = new Map(prev);
+              next.delete(peerId);
+              return next;
+            });
+          };
+
+          track.onended = clearPeerVideoIfCurrentTrack;
+
           setRemoteVideoStreams((prev) => {
             const next = new Map(prev);
-            next.set(peerId, new MediaStream([track]));
+            next.set(peerId, stream);
             return next;
           });
         },
@@ -445,8 +468,7 @@ export function App() {
     meshRef.current = mesh;
     if (localAudioTrackRef.current) mesh.setLocalAudioTrack(localAudioTrackRef.current);
     if (screenOn && localScreenStream) {
-      const track = localScreenStream.getVideoTracks()[0] ?? null;
-      if (track) mesh.setLocalScreenTrack(track);
+      mesh.setLocalScreenMedia(localScreenStream);
     }
   }
 
@@ -588,13 +610,13 @@ export function App() {
     if (screenOn) return;
     setLastError(null);
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       const track = stream.getVideoTracks()[0] ?? null;
       if (!track) return;
       track.onended = () => stopScreenShare();
       setLocalScreenStream(stream);
       setScreenOn(true);
-      meshRef.current?.setLocalScreenTrack(track);
+      meshRef.current?.setLocalScreenMedia(stream);
     } catch (e) {
       setLastError(e instanceof Error ? e.message : "Failed to start screen share");
     }
@@ -602,7 +624,7 @@ export function App() {
 
   function stopScreenShare() {
     setScreenOn(false);
-    meshRef.current?.setLocalScreenTrack(null);
+    meshRef.current?.setLocalScreenMedia(null);
     localScreenStream?.getTracks().forEach((t) => t.stop());
     setLocalScreenStream(null);
   }
@@ -847,6 +869,7 @@ export function App() {
           joinedVoiceKey={joinedVoiceKey}
           localPeerId={localPeerId}
           localSpeaking={localSpeaking}
+          participants={sortedParticipantsWithConn}
           signalingCounters={signalingCounters}
           speakerDeviceId={speakerDeviceId}
           outputVolume={outputVolume}
@@ -855,6 +878,10 @@ export function App() {
           screenOn={screenOn}
           localScreenStream={localScreenStream}
           remoteVideoStreams={remoteVideoStreams}
+          shareAudioMuted={shareAudioMuted}
+          shareAudioVolume={shareAudioVolume}
+          onToggleShareAudio={() => setShareAudioMuted((v) => !v)}
+          onShareAudioVolumeChange={setShareAudioVolume}
           onPlaybackBlocked={() =>
             setLastError(
               "Remote audio stream arrived but playback was blocked by the browser. Click the voice channel again or Start voice to unlock audio output."
