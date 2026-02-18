@@ -20,8 +20,21 @@ npm run dev
 ```
 
 Varsayılan olarak:
-- Signaling/Text server: `ws://localhost:8787`
+- Signaling/Text server: `ws://localhost:8080`
 - Desktop app: Electron (Vite dev server `http://localhost:5173`)
+
+## Server Docker
+
+Server, dışarıdan erişim için `0.0.0.0` üzerinde dinleyecek şekilde ayarlıdır.
+
+Çalıştırma:
+
+```bash
+docker compose up --build server
+```
+
+Adres:
+- `ws://localhost:8080`
 
 ## TURN (opsiyonel ama bazen gerekli)
 

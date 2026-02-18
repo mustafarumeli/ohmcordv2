@@ -6,7 +6,8 @@ import type { PeerSummary, ServerToClient } from "./protocol.js";
 import { deleteRoomIfEmpty, getOrCreateRoom, getRoom } from "./rooms.js";
 import type { Client } from "./rooms.js";
 
-const PORT = Number(process.env.PORT ?? 8787);
+const HOST = process.env.HOST ?? "0.0.0.0";
+const PORT = Number(process.env.PORT ?? 8080);
 
 function send(ws: { send: (data: string) => void }, msg: ServerToClient) {
   ws.send(JSON.stringify(msg));
@@ -164,8 +165,9 @@ wss.on("connection", (ws) => {
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   // eslint-disable-next-line no-console
-  console.log(`[ohmcord-server] ws://localhost:${PORT}`);
+  const advertisedHost = HOST === "0.0.0.0" ? "localhost" : HOST;
+  console.log(`[ohmcord-server] ws://${advertisedHost}:${PORT}`);
 });
 
