@@ -110,6 +110,7 @@ export function App() {
   const signalingRef = useRef<SignalingClient | null>(null);
   const meshRef = useRef<PeerMesh | null>(null);
   const voiceStopRef = useRef<(() => void) | null>(null);
+  const voiceStartingRef = useRef(false);
   const loopbackStopRef = useRef<(() => void) | null>(null);
   const loopbackAudioRef = useRef<HTMLAudioElement | null>(null);
   const localPeerIdRef = useRef<string | null>(null);
@@ -496,9 +497,12 @@ export function App() {
 
   async function startVoice() {
     if (!joinedVoiceKey || !localPeerId) return;
-    if (voiceOn) return;
+    // Don't rely on React state here (it can be stale within the same tick after stopVoice()).
+    if (voiceStopRef.current) return;
+    if (voiceStartingRef.current) return;
 
     setLastError(null);
+    voiceStartingRef.current = true;
     try {
       void unlockAudioPlayback();
       const { track, stop, setInputGain } = await startVoicePipeline({
@@ -527,11 +531,13 @@ export function App() {
       meshRef.current?.setLocalAudioTrack(track);
     } catch (e) {
       setLastError(e instanceof Error ? e.message : "Failed to start microphone");
+    } finally {
+      voiceStartingRef.current = false;
     }
   }
 
   function stopVoice() {
-    if (!voiceOn) return;
+    if (!voiceStopRef.current) return;
     voiceStopRef.current?.();
     voiceStopRef.current = null;
     setInputGainRef.current = null;
