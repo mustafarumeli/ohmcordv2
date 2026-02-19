@@ -5,6 +5,8 @@ export type Participant = {
   peerId: string;
   displayName: string;
   speaking: boolean;
+  micOn: boolean;
+  deafened: boolean;
   connState?: RTCPeerConnectionState;
   iceState?: RTCIceConnectionState;
 };
@@ -170,6 +172,8 @@ export function VoicePanel(props: {
                 isLocal={tile.isLocal}
                 connState={tile.connState}
                 iceState={tile.iceState}
+                micOn={tile.micOn}
+                deafened={tile.deafened}
                 stream={tile.stream}
                 muted={tile.isLocal ? true : props.shareAudioMuted}
                 volume={tile.isLocal ? 0 : props.shareAudioVolume}
@@ -230,6 +234,8 @@ function ParticipantTile(props: {
   isLocal: boolean;
   connState?: RTCPeerConnectionState;
   iceState?: RTCIceConnectionState;
+  micOn: boolean;
+  deafened: boolean;
   stream: MediaStream | null;
   muted: boolean;
   volume: number;
@@ -275,6 +281,9 @@ function ParticipantTile(props: {
           <div className="voiceTileAvatar">{avatar}</div>
         </div>
       ) : null}
+      <div className="muted" style={{ position: "absolute", bottom: 8, left: 8, fontSize: 11 }}>
+        {title} • {props.micOn ? "mic" : "mic off"} {props.deafened ? "• deaf" : ""}
+      </div>
     </button>
   );
 }

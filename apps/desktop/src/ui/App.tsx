@@ -23,6 +23,7 @@ import { Onboarding } from "./components/Onboarding";
 import { VoicePanel, type Participant } from "./components/VoicePanel";
 import { RemoteAudioRack } from "./components/RemoteAudioRack";
 import { BottomBar } from "./components/BottomBar";
+import { playUiSound, unlockUiSounds } from "./uiSounds";
 
 type PeerConnSummary = {
   connState: RTCPeerConnectionState;
@@ -79,6 +80,7 @@ export function App() {
   const [joinedVoiceKey, setJoinedVoiceKey] = useState<string | null>(null);
 
   const [participants, setParticipants] = useState<Map<string, Participant>>(() => new Map());
+  const [roomParticipantsByRoomId, setRoomParticipantsByRoomId] = useState<Map<string, Map<string, Participant>>>(() => new Map());
 
   const [voiceOn, setVoiceOn] = useState(false);
   const [deafened, setDeafened] = useState(false);
@@ -90,6 +92,7 @@ export function App() {
   const [speakerDeviceId, setSpeakerDeviceId] = useState<string>("default");
   const [inputVolume, setInputVolume] = useState(1);
   const [outputVolume, setOutputVolume] = useState(1);
+  const [peerVolumes, setPeerVolumes] = useState<Record<string, number>>({});
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shareAudioMuted, setShareAudioMuted] = useState(true);
   const [shareAudioVolume, setShareAudioVolume] = useState(1);
@@ -121,6 +124,7 @@ export function App() {
   const localSpeakingRef = useRef<boolean>(localSpeaking);
   const localAudioTrackRef = useRef<MediaStreamTrack | null>(null);
   const setInputGainRef = useRef<((v: number) => void) | null>(null);
+  const watchedRoomIdsRef = useRef<Set<string>>(new Set());
 
   const sortedParticipantsWithConn = useMemo(() => {
     const arr = [...participants.values()];
@@ -130,6 +134,22 @@ export function App() {
       return s ? { ...p, connState: s.connState, iceState: s.iceState } : p;
     });
   }, [participants, peerConnStates]);
+
+  const participantsByChannelId = useMemo(() => {
+    const byChannel: Record<string, { peerId: string; displayName: string; speaking: boolean; micOn: boolean; deafened: boolean }[]> = {};
+    for (const [roomId, roomMap] of roomParticipantsByRoomId.entries()) {
+      const arr = [...roomMap.values()];
+      arr.sort((a, b) => a.displayName.localeCompare(b.displayName));
+      byChannel[roomId] = arr.map((p) => ({
+        peerId: p.peerId,
+        displayName: p.displayName,
+        speaking: p.speaking,
+        micOn: p.micOn,
+        deafened: p.deafened
+      }));
+    }
+    return byChannel;
+  }, [roomParticipantsByRoomId]);
 
   useEffect(() => {
     let mounted = true;
@@ -158,6 +178,8 @@ export function App() {
       onClose: () => {
         setWsOpen(false);
         setLocalPeerId(null);
+        watchedRoomIdsRef.current = new Set();
+        setRoomParticipantsByRoomId(new Map());
         disconnectVoice();
       },
       onSend: (msg) => {
@@ -190,6 +212,15 @@ export function App() {
       // eslint-disable-next-line no-console
       console.debug(`[signaling ${direction}] ${kind}`, next[direction]);
       return next;
+    });
+  }
+
+  function sendLocalVoiceState(roomId: string) {
+    signalingRef.current?.send({
+      type: "state",
+      roomId,
+      micOn: voiceOn,
+      deafened
     });
   }
 
@@ -240,9 +271,18 @@ export function App() {
     const vIn = Number(window.localStorage.getItem("ohmcord.settings.inputVolume") ?? "1");
     const vOut = Number(window.localStorage.getItem("ohmcord.settings.outputVolume") ?? "1");
     const rn = window.localStorage.getItem("ohmcord.settings.rnnoiseOn");
+    const peerRaw = window.localStorage.getItem("ohmcord.settings.peerVolumes");
     if (Number.isFinite(vIn)) setInputVolume(Math.max(0, Math.min(2, vIn)));
     if (Number.isFinite(vOut)) setOutputVolume(Math.max(0, Math.min(1, vOut)));
     if (rn === "0") setRnnoiseOn(false);
+    if (peerRaw) {
+      try {
+        const parsed = JSON.parse(peerRaw) as Record<string, number>;
+        if (parsed && typeof parsed === "object") setPeerVolumes(parsed);
+      } catch {
+        // ignore
+      }
+    }
   }, []);
 
   // Root channels list
@@ -306,6 +346,30 @@ export function App() {
     });
   }, [channels]);
 
+  useEffect(() => {
+    const signaling = signalingRef.current;
+    if (!signaling || !wsOpen) return;
+
+    const nextVoiceIds = new Set(channels.filter((c) => c.type === "voice").map((c) => c.id));
+    const prevVoiceIds = watchedRoomIdsRef.current;
+    for (const roomId of nextVoiceIds) {
+      if (!prevVoiceIds.has(roomId)) {
+        signaling.send({ type: "watch", roomId });
+      }
+    }
+    for (const roomId of prevVoiceIds) {
+      if (!nextVoiceIds.has(roomId)) {
+        signaling.send({ type: "unwatch", roomId });
+        setRoomParticipantsByRoomId((prev) => {
+          const next = new Map(prev);
+          next.delete(roomId);
+          return next;
+        });
+      }
+    }
+    watchedRoomIdsRef.current = nextVoiceIds;
+  }, [channels, wsOpen]);
+
   function handleServerMessage(msg: ServerToClient) {
     if (msg.type === "welcome") {
       setLocalPeerId(msg.peerId);
@@ -323,6 +387,8 @@ export function App() {
             peerId: myPeerId,
             displayName: displayNameRef.current,
             speaking: localSpeakingRef.current,
+            micOn: voiceOn,
+            deafened,
             connState: "connected",
             iceState: "connected"
           });
@@ -330,8 +396,26 @@ export function App() {
         for (const p of msg.peers) next.set(p.peerId, { ...p, speaking: false, connState: "new", iceState: "new" });
         return next;
       });
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map<string, Participant>();
+        const myPeerId = localPeerIdRef.current;
+        if (myPeerId) {
+          roomMap.set(myPeerId, {
+            peerId: myPeerId,
+            displayName: displayNameRef.current,
+            speaking: localSpeakingRef.current,
+            micOn: voiceOn,
+            deafened
+          });
+        }
+        for (const p of msg.peers) roomMap.set(p.peerId, { ...p, speaking: false });
+        next.set(msg.roomId, roomMap);
+        return next;
+      });
 
       ensureMesh(msg.roomId);
+      sendLocalVoiceState(msg.roomId);
       void meshRef.current?.handleSignaling(msg);
       return;
     }
@@ -342,6 +426,14 @@ export function App() {
         next.set(msg.peer.peerId, { ...msg.peer, speaking: false, connState: "new", iceState: "new" });
         return next;
       });
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map(next.get(msg.roomId) ?? []);
+        roomMap.set(msg.peer.peerId, { ...msg.peer, speaking: false });
+        next.set(msg.roomId, roomMap);
+        return next;
+      });
+      playUiSound("join");
       void meshRef.current?.handleSignaling(msg);
       return;
     }
@@ -367,7 +459,66 @@ export function App() {
         next.delete(msg.peerId);
         return next;
       });
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map(next.get(msg.roomId) ?? []);
+        roomMap.delete(msg.peerId);
+        next.set(msg.roomId, roomMap);
+        return next;
+      });
+      playUiSound("leave");
       void meshRef.current?.handleSignaling(msg);
+      return;
+    }
+
+    if (msg.type === "room-peers") {
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map<string, Participant>();
+        for (const p of msg.peers) roomMap.set(p.peerId, { ...p, speaking: false });
+        next.set(msg.roomId, roomMap);
+        return next;
+      });
+      return;
+    }
+
+    if (msg.type === "room-peer-joined") {
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map(next.get(msg.roomId) ?? []);
+        roomMap.set(msg.peer.peerId, { ...msg.peer, speaking: false });
+        next.set(msg.roomId, roomMap);
+        return next;
+      });
+      return;
+    }
+
+    if (msg.type === "room-peer-left") {
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map(next.get(msg.roomId) ?? []);
+        roomMap.delete(msg.peerId);
+        next.set(msg.roomId, roomMap);
+        return next;
+      });
+      return;
+    }
+
+    if (msg.type === "peer-state") {
+      setParticipants((prev) => {
+        const next = new Map(prev);
+        const p = next.get(msg.peerId);
+        if (p) next.set(msg.peerId, { ...p, micOn: msg.micOn, deafened: msg.deafened });
+        return next;
+      });
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map(next.get(msg.roomId) ?? []);
+        const p = roomMap.get(msg.peerId);
+        if (p) roomMap.set(msg.peerId, { ...p, micOn: msg.micOn, deafened: msg.deafened });
+        next.set(msg.roomId, roomMap);
+        return next;
+      });
       return;
     }
 
@@ -387,6 +538,14 @@ export function App() {
         const next = new Map(prev);
         const p = next.get(msg.from);
         if (p) next.set(msg.from, { ...p, speaking: msg.speaking });
+        return next;
+      });
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map(next.get(msg.roomId) ?? []);
+        const p = roomMap.get(msg.from);
+        if (p) roomMap.set(msg.from, { ...p, speaking: msg.speaking });
+        next.set(msg.roomId, roomMap);
         return next;
       });
       return;
@@ -482,7 +641,10 @@ export function App() {
     if (joinedVoiceKeyRef.current === key) return;
 
     // switch: leave old voice room first
-    if (joinedVoiceKeyRef.current) signaling.send({ type: "leave" });
+    if (joinedVoiceKeyRef.current) {
+      signaling.send({ type: "leave" });
+      playUiSound("leave");
+    }
     cleanupVoiceState();
 
     setSignalingCounters({
@@ -495,21 +657,53 @@ export function App() {
     joinedVoiceKeyRef.current = key;
     setParticipants(() => {
       const m = new Map<string, Participant>();
-      m.set(myPeerId, { peerId: myPeerId, displayName: displayNameRef.current, speaking: localSpeakingRef.current });
+      m.set(myPeerId, {
+        peerId: myPeerId,
+        displayName: displayNameRef.current,
+        speaking: localSpeakingRef.current,
+        micOn: voiceOn,
+        deafened
+      });
       return m;
+    });
+    setRoomParticipantsByRoomId((prev) => {
+      const next = new Map(prev);
+      const roomMap = new Map(next.get(key) ?? []);
+      roomMap.set(myPeerId, {
+        peerId: myPeerId,
+        displayName: displayNameRef.current,
+        speaking: localSpeakingRef.current,
+        micOn: voiceOn,
+        deafened
+      });
+      next.set(key, roomMap);
+      return next;
     });
 
     ensureMesh(key);
     signaling.send({ type: "join", roomId: key, user: { displayName: displayNameRef.current } });
+    void unlockUiSounds();
+    playUiSound("join");
     void unlockAudioPlayback();
   }
 
   function cleanupVoiceState() {
+    const currentRoomId = joinedVoiceKeyRef.current;
+    const myPeerId = localPeerIdRef.current;
     setJoinedVoiceKey(null);
     meshRef.current?.closeAll();
     meshRef.current = null;
     stopLoopbackTest();
     setParticipants(new Map());
+    if (currentRoomId && myPeerId) {
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map(next.get(currentRoomId) ?? []);
+        roomMap.delete(myPeerId);
+        next.set(currentRoomId, roomMap);
+        return next;
+      });
+    }
     setRemoteAudioStreams(new Map());
     setRemoteVideoStreams(new Map());
     setPeerConnStates(new Map());
@@ -519,6 +713,7 @@ export function App() {
     signalingRef.current?.send({ type: "leave" });
     stopVoice();
     cleanupVoiceState();
+    playUiSound("leave");
   }
 
   async function startVoice() {
@@ -555,6 +750,23 @@ export function App() {
       setVoiceOn(true);
       localAudioTrackRef.current = track;
       meshRef.current?.setLocalAudioTrack(track);
+      setParticipants((prev) => {
+        const next = new Map(prev);
+        const me = localPeerId ? next.get(localPeerId) : null;
+        if (localPeerId && me) next.set(localPeerId, { ...me, micOn: true });
+        return next;
+      });
+      if (joinedVoiceKeyRef.current && localPeerId) {
+        setRoomParticipantsByRoomId((prev) => {
+          const next = new Map(prev);
+          const roomMap = new Map(next.get(joinedVoiceKeyRef.current!) ?? []);
+          const me = roomMap.get(localPeerId);
+          if (me) roomMap.set(localPeerId, { ...me, micOn: true });
+          next.set(joinedVoiceKeyRef.current!, roomMap);
+          return next;
+        });
+      }
+      if (joinedVoiceKeyRef.current) sendLocalVoiceState(joinedVoiceKeyRef.current);
     } catch (e) {
       setLastError(e instanceof Error ? e.message : "Failed to start microphone");
     } finally {
@@ -571,6 +783,25 @@ export function App() {
     localAudioTrackRef.current = null;
     meshRef.current?.setLocalAudioTrack(null);
     setLocalSpeaking(false);
+    const myPeerId = localPeerIdRef.current;
+    const roomId = joinedVoiceKeyRef.current;
+    setParticipants((prev) => {
+      const next = new Map(prev);
+      const me = myPeerId ? next.get(myPeerId) : null;
+      if (myPeerId && me) next.set(myPeerId, { ...me, micOn: false, speaking: false });
+      return next;
+    });
+    if (roomId && myPeerId) {
+      setRoomParticipantsByRoomId((prev) => {
+        const next = new Map(prev);
+        const roomMap = new Map(next.get(roomId) ?? []);
+        const me = roomMap.get(myPeerId);
+        if (me) roomMap.set(myPeerId, { ...me, micOn: false, speaking: false });
+        next.set(roomId, roomMap);
+        return next;
+      });
+      sendLocalVoiceState(roomId);
+    }
   }
 
   async function startLoopbackTest() {
@@ -607,6 +838,37 @@ export function App() {
     loopbackStopRef.current?.();
     loopbackStopRef.current = null;
     setLoopbackOn(false);
+  }
+
+  function toggleDeafen() {
+    setDeafened((prev) => {
+      const next = !prev;
+      const myPeerId = localPeerIdRef.current;
+      const roomId = joinedVoiceKeyRef.current;
+      setParticipants((state) => {
+        const m = new Map(state);
+        const me = myPeerId ? m.get(myPeerId) : null;
+        if (myPeerId && me) m.set(myPeerId, { ...me, deafened: next });
+        return m;
+      });
+      if (roomId && myPeerId) {
+        setRoomParticipantsByRoomId((state) => {
+          const m = new Map(state);
+          const roomMap = new Map(m.get(roomId) ?? []);
+          const me = roomMap.get(myPeerId);
+          if (me) roomMap.set(myPeerId, { ...me, deafened: next });
+          m.set(roomId, roomMap);
+          return m;
+        });
+        signalingRef.current?.send({
+          type: "state",
+          roomId,
+          micOn: voiceOn,
+          deafened: next
+        });
+      }
+      return next;
+    });
   }
 
   async function startScreenShare() {
@@ -696,6 +958,9 @@ export function App() {
   useEffect(() => {
     window.localStorage.setItem("ohmcord.settings.outputVolume", String(outputVolume));
   }, [outputVolume]);
+  useEffect(() => {
+    window.localStorage.setItem("ohmcord.settings.peerVolumes", JSON.stringify(peerVolumes));
+  }, [peerVolumes]);
   useEffect(() => {
     window.localStorage.setItem("ohmcord.settings.rnnoiseOn", rnnoiseOn ? "1" : "0");
     if (voiceOn) {
@@ -832,9 +1097,17 @@ export function App() {
                 channels={channels}
                 selectedChannelId={selectedChannelId}
                 disabled={!uid}
-                joinedVoiceKey={joinedVoiceKey}
-                participants={sortedParticipantsWithConn.map((p) => ({ peerId: p.peerId, displayName: p.displayName, speaking: p.speaking }))}
+                localPeerId={localPeerId}
+                participantsByChannelId={participantsByChannelId}
+                peerVolumes={peerVolumes}
+                onPeerVolumeChange={(peerId, volume) =>
+                  setPeerVolumes((prev) => ({
+                    ...prev,
+                    [peerId]: Math.max(0, Math.min(1, volume))
+                  }))
+                }
                 onSelect={(id) => {
+                  void unlockUiSounds();
                   setSelectedChannelId(id);
                   const c = channels.find((x) => x.id === id);
                   const t = c?.type ?? "text";
@@ -899,13 +1172,19 @@ export function App() {
           displayName={displayName}
           disabled={needsOnboarding}
           onError={(msg) => setLastError(msg)}
+          onIncomingMessage={() => playUiSound("message")}
+          onSentMessage={() => {
+            void unlockUiSounds();
+            playUiSound("sent");
+          }}
         />
       )}
 
       <RemoteAudioRack
         streams={remoteAudioStreams}
         speakerDeviceId={speakerDeviceId}
-        volume={outputVolume}
+        globalVolume={outputVolume}
+        peerVolumes={peerVolumes}
         deafened={deafened}
         onPlaybackBlocked={() =>
           setLastError(
@@ -923,8 +1202,12 @@ export function App() {
         settingsOpen={settingsOpen}
         onToggleSettings={() => setSettingsOpen((v) => !v)}
         onCloseSettings={() => setSettingsOpen(false)}
-        onToggleMic={() => (voiceOn ? stopVoice() : void startVoice())}
-        onToggleDeafen={() => setDeafened((v) => !v)}
+        onToggleMic={() => {
+          void unlockUiSounds();
+          if (voiceOn) stopVoice();
+          else void startVoice();
+        }}
+        onToggleDeafen={toggleDeafen}
         onDisconnectVoice={disconnectVoice}
         rnnoiseOn={rnnoiseOn}
         setRnnoiseOn={setRnnoiseOn}

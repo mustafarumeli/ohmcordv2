@@ -37,6 +37,8 @@ export function ChatPanel(props: {
   displayName: string;
   disabled?: boolean;
   onError?: (msg: string) => void;
+  onIncomingMessage?: () => void;
+  onSentMessage?: () => void;
 }) {
   const canUse = Boolean(props.channelId && props.uid) && !props.disabled;
   const [draft, setDraft] = useState("");
@@ -54,6 +56,7 @@ export function ChatPanel(props: {
   const unsubRef = useRef<(() => void) | null>(null);
   const atBottomRef = useRef(true);
   const lastCountRef = useRef(0);
+  const firstLiveSnapRef = useRef(true);
 
   const emptyState = useMemo(() => {
     if (!props.channelId) return "Select a channel.";
@@ -139,6 +142,7 @@ export function ChatPanel(props: {
     loadingOlderRef.current = false;
     setLoadingOlder(false);
     lastCountRef.current = 0;
+    firstLiveSnapRef.current = true;
 
     unsubRef.current?.();
     unsubRef.current = null;
@@ -156,6 +160,13 @@ export function ChatPanel(props: {
       const unsub = onSnapshot(
         live,
         (snap) => {
+          const addedFromOthers = snap
+            .docChanges()
+            .filter((c) => c.type === "added")
+            .some((c) => {
+              const data = c.doc.data() as { uid?: string };
+              return Boolean(data.uid && data.uid !== props.uid);
+            });
           for (const d of snap.docs) {
             const data = d.data() as { uid?: string; fromName?: string; message?: string; ts?: unknown };
             messageByIdRef.current.set(d.id, {
@@ -167,6 +178,11 @@ export function ChatPanel(props: {
             });
           }
           recomputeMessages();
+          if (firstLiveSnapRef.current) {
+            firstLiveSnapRef.current = false;
+          } else if (addedFromOthers) {
+            props.onIncomingMessage?.();
+          }
         },
         (err) => props.onError?.(err instanceof Error ? err.message : "Failed to listen for messages")
       );
@@ -174,7 +190,7 @@ export function ChatPanel(props: {
     } catch (e) {
       props.onError?.(e instanceof Error ? e.message : "Failed to start message listener");
     }
-  }, [loadOlder, props.channelId, props.onError, recomputeMessages]);
+  }, [loadOlder, props.channelId, props.onError, props.onIncomingMessage, props.uid, recomputeMessages]);
 
   useLayoutEffect(() => {
     const adj = pendingScrollAdjustRef.current;
@@ -210,6 +226,7 @@ export function ChatPanel(props: {
         message: text,
         ts: serverTimestamp()
       });
+      props.onSentMessage?.();
     } catch (e) {
       props.onError?.(e instanceof Error ? e.message : "Failed to send message");
     }

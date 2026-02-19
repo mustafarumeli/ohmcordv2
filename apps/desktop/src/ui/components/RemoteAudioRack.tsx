@@ -4,7 +4,8 @@ function RemoteAudioEl(props: {
   peerId: string;
   stream: MediaStream;
   speakerDeviceId: string;
-  volume: number;
+  globalVolume: number;
+  peerVolume: number;
   deafened: boolean;
   onPlaybackBlocked?: () => void;
 }) {
@@ -15,13 +16,13 @@ function RemoteAudioEl(props: {
     if (!el) return;
     el.srcObject = props.stream;
     el.muted = props.deafened;
-    el.volume = props.volume;
+    el.volume = Math.max(0, Math.min(1, props.globalVolume * props.peerVolume));
     const sinkAudio = el as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
     if (props.speakerDeviceId !== "default" && typeof sinkAudio.setSinkId === "function") {
       void sinkAudio.setSinkId(props.speakerDeviceId).catch(() => props.onPlaybackBlocked?.());
     }
     void el.play().catch(() => props.onPlaybackBlocked?.());
-  }, [props.deafened, props.onPlaybackBlocked, props.speakerDeviceId, props.stream, props.volume]);
+  }, [props.deafened, props.globalVolume, props.onPlaybackBlocked, props.peerVolume, props.speakerDeviceId, props.stream]);
 
   return <audio ref={ref} autoPlay playsInline data-peerid={props.peerId} />;
 }
@@ -29,7 +30,8 @@ function RemoteAudioEl(props: {
 export function RemoteAudioRack(props: {
   streams: Map<string, MediaStream>;
   speakerDeviceId: string;
-  volume: number;
+  globalVolume: number;
+  peerVolumes: Record<string, number>;
   deafened?: boolean;
   onPlaybackBlocked?: () => void;
 }) {
@@ -43,7 +45,8 @@ export function RemoteAudioRack(props: {
           peerId={peerId}
           stream={stream}
           speakerDeviceId={props.speakerDeviceId}
-          volume={props.volume}
+          globalVolume={props.globalVolume}
+          peerVolume={Math.max(0, Math.min(1, props.peerVolumes[peerId] ?? 1))}
           deafened={deafened}
           onPlaybackBlocked={props.onPlaybackBlocked}
         />

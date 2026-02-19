@@ -13,7 +13,21 @@ export const ClientToServer = z.discriminatedUnion("type", [
     })
   }),
   z.object({
+    type: z.literal("watch"),
+    roomId: RoomId
+  }),
+  z.object({
+    type: z.literal("unwatch"),
+    roomId: RoomId
+  }),
+  z.object({
     type: z.literal("leave")
+  }),
+  z.object({
+    type: z.literal("state"),
+    roomId: RoomId,
+    micOn: z.boolean(),
+    deafened: z.boolean()
   }),
   z.object({
     type: z.literal("offer"),
@@ -48,6 +62,8 @@ export type ClientToServer = z.infer<typeof ClientToServer>;
 export type PeerSummary = {
   peerId: string;
   displayName: string;
+  micOn: boolean;
+  deafened: boolean;
 };
 
 export type ServerToClient =
@@ -61,7 +77,17 @@ export type ServerToClient =
       peers: PeerSummary[];
     }
   | {
+      type: "room-peers";
+      roomId: string;
+      peers: PeerSummary[];
+    }
+  | {
       type: "peer-joined";
+      roomId: string;
+      peer: PeerSummary;
+    }
+  | {
+      type: "room-peer-joined";
       roomId: string;
       peer: PeerSummary;
     }
@@ -69,6 +95,18 @@ export type ServerToClient =
       type: "peer-left";
       roomId: string;
       peerId: string;
+    }
+  | {
+      type: "room-peer-left";
+      roomId: string;
+      peerId: string;
+    }
+  | {
+      type: "peer-state";
+      roomId: string;
+      peerId: string;
+      micOn: boolean;
+      deafened: boolean;
     }
   | {
       type: "offer";

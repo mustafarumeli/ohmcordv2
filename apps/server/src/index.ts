@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { WebSocketServer } from "ws";
 import { ClientToServer } from "./protocol.js";
 import type { PeerSummary, ServerToClient } from "./protocol.js";
-import { deleteRoomIfEmpty, getOrCreateRoom, getRoom } from "./rooms.js";
+import { deleteRoomIfEmpty, getOrCreateRoom, getRoom, removeWatcherFromAllRooms } from "./rooms.js";
 import type { Client } from "./rooms.js";
 
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -24,6 +24,43 @@ function safeParseMessage(raw: unknown) {
   }
 }
 
+function toPeerSummary(client: Client): PeerSummary {
+  return {
+    peerId: client.peerId,
+    displayName: client.displayName,
+    micOn: client.micOn,
+    deafened: client.deafened
+  };
+}
+
+function roomRecipients(room: { clients: Map<string, Client>; watchers: Map<string, Client> }) {
+  const recipients = new Map<string, Client>();
+  for (const c of room.clients.values()) recipients.set(c.peerId, c);
+  for (const w of room.watchers.values()) recipients.set(w.peerId, w);
+  return recipients;
+}
+
+function leaveCurrentRoom(client: Client) {
+  if (!client.roomId) return;
+  const room = getRoom(client.roomId);
+  if (!room) {
+    client.roomId = null;
+    return;
+  }
+
+  room.clients.delete(client.peerId);
+  for (const other of room.clients.values()) {
+    send(other.ws, { type: "peer-left", roomId: room.roomId, peerId: client.peerId });
+  }
+  for (const other of roomRecipients(room).values()) {
+    if (other.peerId === client.peerId) continue;
+    send(other.ws, { type: "room-peer-left", roomId: room.roomId, peerId: client.peerId });
+  }
+  const leavingRoomId = room.roomId;
+  client.roomId = null;
+  deleteRoomIfEmpty(leavingRoomId);
+}
+
 const server = http.createServer();
 const wss = new WebSocketServer({ server });
 
@@ -33,7 +70,9 @@ wss.on("connection", (ws) => {
     ws,
     peerId,
     displayName: "Anonymous",
-    roomId: null
+    roomId: null,
+    micOn: false,
+    deafened: false
   };
 
   send(ws, { type: "welcome", peerId });
@@ -43,21 +82,7 @@ wss.on("connection", (ws) => {
     if (!msg) return;
 
     if (msg.type === "join") {
-      // leave previous room (if any)
-      if (client.roomId) {
-        const prevRoom = getRoom(client.roomId);
-        if (prevRoom) {
-          prevRoom.clients.delete(client.peerId);
-          for (const other of prevRoom.clients.values()) {
-            send(other.ws, {
-              type: "peer-left",
-              roomId: prevRoom.roomId,
-              peerId: client.peerId
-            });
-          }
-          deleteRoomIfEmpty(prevRoom.roomId);
-        }
-      }
+      leaveCurrentRoom(client);
 
       client.displayName = msg.user.displayName;
       client.roomId = msg.roomId;
@@ -67,7 +92,7 @@ wss.on("connection", (ws) => {
 
       const peers: PeerSummary[] = [...room.clients.values()]
         .filter((c) => c.peerId !== client.peerId)
-        .map((c) => ({ peerId: c.peerId, displayName: c.displayName }));
+        .map(toPeerSummary);
 
       send(ws, { type: "peers", roomId: room.roomId, peers });
 
@@ -76,27 +101,59 @@ wss.on("connection", (ws) => {
         send(other.ws, {
           type: "peer-joined",
           roomId: room.roomId,
-          peer: { peerId: client.peerId, displayName: client.displayName }
+          peer: toPeerSummary(client)
+        });
+      }
+      for (const other of roomRecipients(room).values()) {
+        if (other.peerId === client.peerId) continue;
+        send(other.ws, {
+          type: "room-peer-joined",
+          roomId: room.roomId,
+          peer: toPeerSummary(client)
         });
       }
 
       return;
     }
 
-    if (msg.type === "leave") {
+    if (msg.type === "watch") {
+      const room = getOrCreateRoom(msg.roomId);
+      room.watchers.set(client.peerId, client);
+      const peers: PeerSummary[] = [...room.clients.values()].map(toPeerSummary);
+      send(ws, { type: "room-peers", roomId: room.roomId, peers });
+      return;
+    }
+
+    if (msg.type === "unwatch") {
+      const room = getRoom(msg.roomId);
+      if (!room) return;
+      room.watchers.delete(client.peerId);
+      deleteRoomIfEmpty(room.roomId);
+      return;
+    }
+
+    if (msg.type === "state") {
       if (!client.roomId) return;
       const room = getRoom(client.roomId);
-      if (!room) {
-        client.roomId = null;
-        return;
+      if (!room) return;
+      if (msg.roomId !== room.roomId) return;
+      client.micOn = msg.micOn;
+      client.deafened = msg.deafened;
+      for (const other of roomRecipients(room).values()) {
+        if (other.peerId === client.peerId) continue;
+        send(other.ws, {
+          type: "peer-state",
+          roomId: room.roomId,
+          peerId: client.peerId,
+          micOn: client.micOn,
+          deafened: client.deafened
+        });
       }
-      room.clients.delete(client.peerId);
-      for (const other of room.clients.values()) {
-        send(other.ws, { type: "peer-left", roomId: room.roomId, peerId: client.peerId });
-      }
-      const leavingRoomId = room.roomId;
-      client.roomId = null;
-      deleteRoomIfEmpty(leavingRoomId);
+      return;
+    }
+
+    if (msg.type === "leave") {
+      leaveCurrentRoom(client);
       return;
     }
 
@@ -127,7 +184,7 @@ wss.on("connection", (ws) => {
         type: "text",
         roomId: msg.roomId,
         channelId: msg.channelId,
-        from: { peerId: client.peerId, displayName: client.displayName },
+        from: toPeerSummary(client),
         message: msg.message,
         ts: Date.now()
       };
@@ -152,16 +209,8 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    if (!client.roomId) return;
-    const room = getRoom(client.roomId);
-    if (!room) return;
-    room.clients.delete(client.peerId);
-    for (const other of room.clients.values()) {
-      send(other.ws, { type: "peer-left", roomId: room.roomId, peerId: client.peerId });
-    }
-    const roomId = room.roomId;
-    client.roomId = null;
-    deleteRoomIfEmpty(roomId);
+    leaveCurrentRoom(client);
+    removeWatcherFromAllRooms(client.peerId);
   });
 });
 
