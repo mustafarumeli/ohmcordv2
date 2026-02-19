@@ -40,6 +40,7 @@ type SignalingCounters = {
 const EMPTY_SIGNAL_COUNTER: SignalCounter = { offer: 0, answer: 0, ice: 0 };
 
 const SIGNALING_URL = (import.meta.env.VITE_SIGNALING_URL as string | undefined) ?? "ws://localhost:8080";
+const UNREAD_STORAGE_KEY = "ohmcord.chat.unreadByChannel";
 
 function friendlyFirebaseError(e: unknown): string {
   const code =
@@ -73,6 +74,23 @@ export function App() {
   const [channels, setChannels] = useState<ChannelSummary[]>([]);
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
   const [activePanel, setActivePanel] = useState<"text" | "voice">("text");
+  const [unreadByChannelId, setUnreadByChannelId] = useState<Record<string, number>>(() => {
+    try {
+      const raw = window.localStorage.getItem(UNREAD_STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object") return {};
+      const next: Record<string, number> = {};
+      for (const [channelId, value] of Object.entries(parsed)) {
+        if (typeof value !== "number" || !Number.isFinite(value)) continue;
+        const count = Math.max(0, Math.floor(value));
+        if (count > 0) next[channelId] = count;
+      }
+      return next;
+    } catch {
+      return {};
+    }
+  });
   const selectedChannel = useMemo(() => channels.find((c) => c.id === selectedChannelId) ?? null, [channels, selectedChannelId]);
 
   const [wsOpen, setWsOpen] = useState(false);
@@ -125,6 +143,11 @@ export function App() {
   const localAudioTrackRef = useRef<MediaStreamTrack | null>(null);
   const setInputGainRef = useRef<((v: number) => void) | null>(null);
   const watchedRoomIdsRef = useRef<Set<string>>(new Set());
+  const selectedChannelIdRef = useRef<string | null>(selectedChannelId);
+  const activePanelRef = useRef<"text" | "voice">(activePanel);
+  const uidRef = useRef<string | null>(uid);
+  const textUnreadUnsubsRef = useRef<Map<string, () => void>>(new Map());
+  const textUnreadInitializedRef = useRef<Set<string>>(new Set());
 
   const sortedParticipantsWithConn = useMemo(() => {
     const arr = [...participants.values()];
@@ -231,6 +254,18 @@ export function App() {
   useEffect(() => {
     joinedVoiceKeyRef.current = joinedVoiceKey;
   }, [joinedVoiceKey]);
+
+  useEffect(() => {
+    selectedChannelIdRef.current = selectedChannelId;
+  }, [selectedChannelId]);
+
+  useEffect(() => {
+    activePanelRef.current = activePanel;
+  }, [activePanel]);
+
+  useEffect(() => {
+    uidRef.current = uid;
+  }, [uid]);
 
   useEffect(() => {
     displayNameRef.current = displayName;
@@ -345,6 +380,88 @@ export function App() {
       return firstText;
     });
   }, [channels]);
+
+  useEffect(() => {
+    const textChannelIds = new Set(channels.filter((c) => c.type === "text").map((c) => c.id));
+    setUnreadByChannelId((prev) => {
+      let changed = false;
+      const next: Record<string, number> = {};
+      for (const [channelId, count] of Object.entries(prev)) {
+        if (!textChannelIds.has(channelId)) {
+          changed = true;
+          continue;
+        }
+        next[channelId] = count;
+      }
+      return changed ? next : prev;
+    });
+
+    for (const [channelId, unsub] of textUnreadUnsubsRef.current.entries()) {
+      if (textChannelIds.has(channelId)) continue;
+      unsub();
+      textUnreadUnsubsRef.current.delete(channelId);
+      textUnreadInitializedRef.current.delete(channelId);
+    }
+
+    try {
+      const db = getFirebaseDb();
+      for (const channelId of textChannelIds) {
+        if (textUnreadUnsubsRef.current.has(channelId)) continue;
+        const live = query(collection(db, "channels", channelId, "messages"), orderBy("ts", "desc"), limit(50));
+        const unsub = onSnapshot(
+          live,
+          (snap) => {
+            if (!textUnreadInitializedRef.current.has(channelId)) {
+              textUnreadInitializedRef.current.add(channelId);
+              return;
+            }
+
+            const currentUid = uidRef.current;
+            const addedFromOthers = snap
+              .docChanges()
+              .filter((c) => c.type === "added")
+              .reduce((sum, c) => {
+                const data = c.doc.data() as { uid?: string };
+                if (!data.uid || data.uid === currentUid) return sum;
+                return sum + 1;
+              }, 0);
+
+            if (addedFromOthers <= 0) return;
+            const isActiveTextChannel = activePanelRef.current === "text" && selectedChannelIdRef.current === channelId;
+            if (isActiveTextChannel) return;
+            setUnreadByChannelId((prev) => ({
+              ...prev,
+              [channelId]: (prev[channelId] ?? 0) + addedFromOthers
+            }));
+          },
+          (err) => setLastError(friendlyFirebaseError(err))
+        );
+        textUnreadUnsubsRef.current.set(channelId, unsub);
+      }
+    } catch (e) {
+      setLastError(friendlyFirebaseError(e));
+    }
+  }, [channels]);
+
+  useEffect(() => {
+    if (!selectedChannelId) return;
+    const selected = channels.find((c) => c.id === selectedChannelId);
+    if (!selected || selected.type !== "text") return;
+    setUnreadByChannelId((prev) => {
+      if (!prev[selectedChannelId]) return prev;
+      const next = { ...prev };
+      delete next[selectedChannelId];
+      return next;
+    });
+  }, [channels, selectedChannelId]);
+
+  useEffect(() => {
+    return () => {
+      for (const unsub of textUnreadUnsubsRef.current.values()) unsub();
+      textUnreadUnsubsRef.current.clear();
+      textUnreadInitializedRef.current.clear();
+    };
+  }, []);
 
   useEffect(() => {
     const signaling = signalingRef.current;
@@ -962,6 +1079,9 @@ export function App() {
     window.localStorage.setItem("ohmcord.settings.peerVolumes", JSON.stringify(peerVolumes));
   }, [peerVolumes]);
   useEffect(() => {
+    window.localStorage.setItem(UNREAD_STORAGE_KEY, JSON.stringify(unreadByChannelId));
+  }, [unreadByChannelId]);
+  useEffect(() => {
     window.localStorage.setItem("ohmcord.settings.rnnoiseOn", rnnoiseOn ? "1" : "0");
     if (voiceOn) {
       // apply on next start by restarting; keep simple and predictable
@@ -1096,6 +1216,7 @@ export function App() {
               <ChannelList
                 channels={channels}
                 selectedChannelId={selectedChannelId}
+                unreadByChannelId={unreadByChannelId}
                 disabled={!uid}
                 localPeerId={localPeerId}
                 participantsByChannelId={participantsByChannelId}
@@ -1108,10 +1229,18 @@ export function App() {
                 }
                 onSelect={(id) => {
                   void unlockUiSounds();
-                  setSelectedChannelId(id);
                   const c = channels.find((x) => x.id === id);
                   const t = c?.type ?? "text";
+                  setSelectedChannelId(id);
                   setActivePanel(t === "voice" ? "voice" : "text");
+                  if (t === "text") {
+                    setUnreadByChannelId((prev) => {
+                      if (!prev[id]) return prev;
+                      const next = { ...prev };
+                      delete next[id];
+                      return next;
+                    });
+                  }
                   if (t === "voice") joinVoiceChannel(id);
                 }}
               />
@@ -1172,7 +1301,9 @@ export function App() {
           displayName={displayName}
           disabled={needsOnboarding}
           onError={(msg) => setLastError(msg)}
-          onIncomingMessage={() => playUiSound("message")}
+          onIncomingMessage={(_channelId) => {
+            playUiSound("message");
+          }}
           onSentMessage={() => {
             void unlockUiSounds();
             playUiSound("sent");

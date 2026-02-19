@@ -126,7 +126,7 @@ export function ChatPanel(props: {
   displayName: string;
   disabled?: boolean;
   onError?: (msg: string) => void;
-  onIncomingMessage?: () => void;
+  onIncomingMessage?: (channelId: string) => void;
   onSentMessage?: () => void;
 }) {
   const canUse = Boolean(props.channelId && props.uid) && !props.disabled;
@@ -271,7 +271,7 @@ export function ChatPanel(props: {
           if (firstLiveSnapRef.current) {
             firstLiveSnapRef.current = false;
           } else if (addedFromOthers) {
-            props.onIncomingMessage?.();
+            if (props.channelId) props.onIncomingMessage?.(props.channelId);
           }
         },
         (err) => props.onError?.(err instanceof Error ? err.message : "Failed to listen for messages")

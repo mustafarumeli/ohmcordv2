@@ -19,6 +19,7 @@ export type ChannelParticipant = {
 export function ChannelList(props: {
   channels: ChannelSummary[];
   selectedChannelId: string | null;
+  unreadByChannelId: Record<string, number>;
   onSelect: (channelId: string) => void;
   localPeerId?: string | null;
   participantsByChannelId: Record<string, ChannelParticipant[]>;
@@ -59,7 +60,9 @@ export function ChannelList(props: {
     <>
       <div className="channelList">
         {list.length === 0 ? <div className="muted">No channels</div> : null}
-        {list.map((c) => (
+        {list.map((c) => {
+          const unread = c.type === "text" ? Math.max(0, Math.floor(props.unreadByChannelId[c.id] ?? 0)) : 0;
+          return (
           <div key={c.id}>
             <button
               className={`channelItem ${props.selectedChannelId === c.id ? "channelItemActive" : ""}`}
@@ -69,6 +72,7 @@ export function ChannelList(props: {
             >
               <span className="channelHash">{c.type === "voice" ? "🔊" : "#"}</span>
               <span className="channelName">{c.name}</span>
+              {unread > 0 ? <span className="channelUnreadBadge">{unread > 99 ? "99+" : unread}</span> : null}
             </button>
 
             {c.type === "voice" ? (
@@ -107,7 +111,8 @@ export function ChannelList(props: {
               </div>
             ) : null}
           </div>
-        ))}
+        );
+        })}
       </div>
 
       {volumePopover ? (
