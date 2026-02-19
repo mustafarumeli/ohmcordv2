@@ -9,10 +9,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "formidable": "^3.5.4",
     "ws": "^8.19.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/formidable": "^3.4.6",
     "@types/node": "^25.2.3",
     "@types/ws": "^8.18.1",
     "tsx": "^4.21.0",

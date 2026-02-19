@@ -273,17 +273,20 @@ select {
 
 .chatMsgRow {
   display: grid;
-  grid-template-columns: 24px 1fr;
-  gap: 8px;
-  padding: 2px 4px;
-  border-radius: 10px;
+  grid-template-columns: 28px 1fr;
+  gap: 10px;
+  padding: 6px 4px;
+  border-radius: 12px;
 }
 .chatMsgRow:hover {
   background: rgba(255, 255, 255, 0.03);
 }
+.chatMsgOwn .chatMsgMeta {
+  justify-content: flex-end;
+}
 .chatMsgAvatar {
-  width: 24px;
-  height: 24px;
+  width: 28px;
+  height: 28px;
   border-radius: 999px;
   background: rgba(110, 231, 183, 0.12);
   border: 1px solid rgba(110, 231, 183, 0.22);
@@ -310,11 +313,64 @@ select {
   font-size: 10px;
 }
 .chatMsgText {
-  margin-top: 2px;
+  margin-top: 0;
   white-space: pre-wrap;
   word-break: break-word;
-  line-height: 1.2;
+  line-height: 1.35;
+  font-size: 13px;
+}
+.chatMsgBubble {
+  margin-top: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 12px;
+  padding: 8px 10px;
+  display: grid;
+  gap: 8px;
+}
+.chatMsgOwn .chatMsgBubble {
+  border-color: rgba(110, 231, 183, 0.28);
+  background: rgba(110, 231, 183, 0.08);
+}
+.chatAttachment {
+  display: grid;
+  gap: 8px;
+}
+.chatAttachmentPreviewLink {
+  display: inline-grid;
+  justify-self: start;
+  max-width: min(360px, 100%);
+}
+.chatAttachmentImage {
+  max-width: 100%;
+  max-height: 220px;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+.chatAttachmentMeta {
+  text-decoration: none;
+  color: var(--text);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  padding: 8px 10px;
+  display: grid;
+  gap: 3px;
+}
+.chatAttachmentMeta:hover {
+  border-color: rgba(110, 231, 183, 0.3);
+}
+.chatAttachmentName {
   font-size: 12px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chatAttachmentInfo {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .connTag {
@@ -334,11 +390,44 @@ select {
 
 .chat {
   display: grid;
-  grid-template-rows: 1fr auto;
-  height: 100%;
+  grid-template-rows: minmax(0, 1fr) auto;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+.chatDropActive .chatLog {
+  outline: 2px dashed rgba(110, 231, 183, 0.85);
+  outline-offset: -10px;
+  background: linear-gradient(180deg, rgba(110, 231, 183, 0.09), rgba(110, 231, 183, 0.03));
+  box-shadow: inset 0 0 0 1px rgba(110, 231, 183, 0.22), inset 0 0 28px rgba(110, 231, 183, 0.12);
+}
+.chatDropHint {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 12, 18, 0.52);
+  backdrop-filter: blur(1px);
+  pointer-events: none;
+}
+.chatDropHint::before {
+  content: "Drop file to attach";
+  border: 2px dashed rgba(110, 231, 183, 0.95);
+  border-radius: 14px;
+  background: rgba(16, 26, 24, 0.92);
+  color: #c8ffe8;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  text-align: center;
+  padding: 14px 20px;
+  min-width: min(460px, calc(100% - 30px));
+  box-shadow: 0 0 0 1px rgba(110, 231, 183, 0.35), 0 20px 45px rgba(0, 0, 0, 0.35), 0 0 30px rgba(110, 231, 183, 0.18);
 }
 .chatLog {
   overflow: auto;
+  min-height: 0;
   padding: 8px 10px;
   display: grid;
   gap: 2px;
@@ -346,12 +435,47 @@ select {
 .chatComposer {
   padding: 10px;
   border-top: 1px solid var(--border);
-  display: flex;
+  display: grid;
+  gap: 8px;
+}
+.chatComposerRow {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
   gap: 8px;
 }
 .chatComposer .input {
   padding: 8px 10px;
   font-size: 13px;
+}
+.chatComposerAttachment {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 6px 8px;
+}
+.chatComposerAttachmentMeta {
+  min-width: 0;
+  display: grid;
+}
+.chatComposerAttachmentName {
+  font-size: 12px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chatComposerAttachmentInfo {
+  font-size: 11px;
+  color: var(--muted);
+}
+.chatAttachIconBtn {
+  width: 38px;
+  height: 38px;
+  padding: 0;
 }
 
 .msg {

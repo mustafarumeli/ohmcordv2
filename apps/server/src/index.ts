@@ -5,6 +5,7 @@ import { ClientToServer } from "./protocol.js";
 import type { PeerSummary, ServerToClient } from "./protocol.js";
 import { deleteRoomIfEmpty, getOrCreateRoom, getRoom, removeWatcherFromAllRooms } from "./rooms.js";
 import type { Client } from "./rooms.js";
+import { handleFileRead, handleUpload } from "./upload.js";
 
 const HOST = process.env.HOST ?? "0.0.0.0";
 const PORT = Number(process.env.PORT ?? 8080);
@@ -61,7 +62,42 @@ function leaveCurrentRoom(client: Client) {
   deleteRoomIfEmpty(leavingRoomId);
 }
 
-const server = http.createServer();
+const server = http.createServer((req, res) => {
+  void (async () => {
+    if (!req.url) {
+      res.statusCode = 404;
+      res.end("Not Found");
+      return;
+    }
+
+    const url = new URL(req.url, `http://${req.headers.host ?? "localhost:8080"}`);
+    if (req.method === "OPTIONS" && url.pathname === "/api/upload") {
+      res.statusCode = 204;
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.end();
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/upload") {
+      await handleUpload(req, res);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/files/")) {
+      await handleFileRead(url.pathname, res);
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end("Not Found");
+  })().catch(() => {
+    if (res.headersSent) return;
+    res.statusCode = 500;
+    res.end("Internal Server Error");
+  });
+});
 const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
