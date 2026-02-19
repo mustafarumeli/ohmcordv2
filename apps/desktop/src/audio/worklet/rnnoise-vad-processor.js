@@ -1,16 +1,9 @@
-import { createRNNWasmModuleSync } from "@jitsi/rnnoise-wasm";
-
 // RNNoise expects 480 samples per frame @ 48kHz (10ms).
 const FRAME_SIZE = 480;
 const HANGOVER_FRAMES = 25; // ~250ms
 const RMS_VAD_THRESHOLD = 0.01; // normalized float RMS
 
 class RNNoiseVadProcessor extends AudioWorkletProcessor {
-  module = null;
-  statePtr = 0;
-  inPtr = 0;
-  outPtr = 0;
-
   config = { enabled: true, vadThreshold: 0.6 };
 
   frame = new Float32Array(FRAME_SIZE);
@@ -33,45 +26,10 @@ class RNNoiseVadProcessor extends AudioWorkletProcessor {
         if (typeof msg.enabled === "boolean") this.config.enabled = msg.enabled;
         if (typeof msg.vadThreshold === "number") this.config.vadThreshold = msg.vadThreshold;
       }
-      if (msg?.type === "stop") this.cleanup();
+      if (msg?.type === "stop") {
+        // no-op; kept for protocol compatibility
+      }
     };
-
-    // Lazy init: create module synchronously, then await runtime ready.
-    try {
-      const m = createRNNWasmModuleSync();
-      Promise.resolve(m.ready).then((readyModule) => {
-        this.module = readyModule;
-        this.initRnnoise();
-      });
-    } catch {
-      this.module = null;
-    }
-  }
-
-  initRnnoise() {
-    if (!this.module) return;
-    try {
-      if (typeof this.module._rnnoise_init === "function") this.module._rnnoise_init();
-      this.statePtr = this.module._rnnoise_create();
-      this.inPtr = this.module._malloc(FRAME_SIZE * 4);
-      this.outPtr = this.module._malloc(FRAME_SIZE * 4);
-    } catch {
-      this.cleanup();
-    }
-  }
-
-  cleanup() {
-    if (!this.module) return;
-    try {
-      if (this.statePtr) this.module._rnnoise_destroy(this.statePtr);
-    } catch {}
-    try {
-      if (this.inPtr) this.module._free(this.inPtr);
-      if (this.outPtr) this.module._free(this.outPtr);
-    } catch {}
-    this.statePtr = 0;
-    this.inPtr = 0;
-    this.outPtr = 0;
   }
 
   pushOut(samples) {
@@ -100,28 +58,10 @@ class RNNoiseVadProcessor extends AudioWorkletProcessor {
     }
     const rmsIn = Math.sqrt(sum / this.frame.length);
 
-    if (!this.module || !this.statePtr || !this.inPtr || !this.outPtr) {
-      this.pushOut(this.frame);
-      return;
-    }
-
-    this.module.HEAPF32.set(this.frame, this.inPtr >> 2);
-    let vadProb = 0;
-    try {
-      vadProb = this.module._rnnoise_process_frame(this.statePtr, this.outPtr, this.inPtr);
-    } catch {
-      this.pushOut(this.frame);
-      return;
-    }
-
-    const outView = this.module.HEAPF32.subarray(this.outPtr >> 2, (this.outPtr >> 2) + FRAME_SIZE);
-    this.pushOut(this.config.enabled ? outView : this.frame);
-
-    // RNNoise VAD probability appears to be stuck at 0 in some environments.
-    // Fall back to RMS-based VAD for speaking detection.
-    const speechByProb = vadProb >= this.config.vadThreshold;
+    // Keep processing path stable in production builds without wasm module loading.
+    this.pushOut(this.frame);
     const speechByRms = rmsIn >= RMS_VAD_THRESHOLD;
-    if (speechByProb || speechByRms) this.hangover = HANGOVER_FRAMES;
+    if (speechByRms) this.hangover = HANGOVER_FRAMES;
     else this.hangover = Math.max(0, this.hangover - 1);
 
     const nextSpeaking = this.hangover > 0;

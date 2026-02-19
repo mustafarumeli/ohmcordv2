@@ -29,6 +29,7 @@ type PeerConnSummary = {
   connState: RTCPeerConnectionState;
   iceState: RTCIceConnectionState;
 };
+type DesktopSource = { id: string; name: string; kind: "screen" | "window"; previewDataUrl: string | null };
 
 type SignalKind = "offer" | "answer" | "ice";
 type SignalCounter = Record<SignalKind, number>;
@@ -112,12 +113,13 @@ export function App() {
   const [outputVolume, setOutputVolume] = useState(1);
   const [peerVolumes, setPeerVolumes] = useState<Record<string, number>>({});
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [shareAudioMuted, setShareAudioMuted] = useState(true);
+  const [shareAudioMuted, setShareAudioMuted] = useState(false);
   const [shareAudioVolume, setShareAudioVolume] = useState(1);
   const [createChannelOpen, setCreateChannelOpen] = useState(false);
   const [createChannelName, setCreateChannelName] = useState("");
   const [createChannelType, setCreateChannelType] = useState<"text" | "voice">("text");
   const [lastError, setLastError] = useState<string | null>(null);
+  const [shareSourceOptions, setShareSourceOptions] = useState<DesktopSource[] | null>(null);
 
   const [screenOn, setScreenOn] = useState(false);
   const [loopbackOn, setLoopbackOn] = useState(false);
@@ -988,24 +990,102 @@ export function App() {
     });
   }
 
+  function applySharedStream(stream: MediaStream) {
+    const track = stream.getVideoTracks()[0] ?? null;
+    if (!track) return;
+    track.onended = () => stopScreenShare();
+    setLocalScreenStream(stream);
+    setScreenOn(true);
+    meshRef.current?.setLocalScreenMedia(stream);
+  }
+
+  async function captureDesktopSource(source: DesktopSource) {
+    const video = {
+      mandatory: {
+        chromeMediaSource: "desktop",
+        chromeMediaSourceId: source.id
+      }
+    } as MediaTrackConstraints;
+
+    // System audio capture is typically available only for full screen sources.
+    const attempts: Array<MediaStreamConstraints> =
+      source.kind === "screen"
+        ? [
+            {
+              audio: {
+                mandatory: {
+                  chromeMediaSource: "desktop",
+                  chromeMediaSourceId: source.id
+                }
+              } as MediaTrackConstraints,
+              video
+            },
+            { audio: true, video },
+            { audio: false, video }
+          ]
+        : [{ audio: false, video }];
+
+    let lastErr: unknown = null;
+    for (const constraints of attempts) {
+      try {
+        return await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error("Failed to capture source");
+  }
+
+  async function startScreenShareWithSourceId(source: DesktopSource) {
+    try {
+      const stream = await captureDesktopSource(source);
+      applySharedStream(stream);
+      setShareSourceOptions(null);
+    } catch (e) {
+      setLastError(e instanceof Error ? e.message : "Failed to start screen share");
+    }
+  }
+
   async function startScreenShare() {
     if (!joinedVoiceKey) return;
     if (screenOn) return;
     setLastError(null);
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-      const track = stream.getVideoTracks()[0] ?? null;
-      if (!track) return;
-      track.onended = () => stopScreenShare();
-      setLocalScreenStream(stream);
-      setScreenOn(true);
-      meshRef.current?.setLocalScreenMedia(stream);
+      const desktopSources = await window.ohmcord?.getDesktopSources?.();
+      if (desktopSources && desktopSources.length > 0) {
+        const sorted = [...desktopSources].sort((a, b) => {
+          if (a.kind !== b.kind) return a.kind === "screen" ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        });
+        setShareSourceOptions(sorted);
+        return;
+      }
+      const hasNativeDisplayMedia = typeof navigator.mediaDevices?.getDisplayMedia === "function";
+      if (hasNativeDisplayMedia) {
+        try {
+          const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+          applySharedStream(stream);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!/not supported/i.test(msg)) throw e;
+          const sourceId = await window.ohmcord?.getDesktopSourceId?.();
+          if (!sourceId) throw e;
+          const stream = await captureDesktopSource({ id: sourceId, name: "Screen", kind: "screen", previewDataUrl: null });
+          applySharedStream(stream);
+        }
+      } else {
+        const sourceId = await window.ohmcord?.getDesktopSourceId?.();
+        if (!sourceId) throw new Error("Screen share is not supported on this build.");
+        const stream = await captureDesktopSource({ id: sourceId, name: "Screen", kind: "screen", previewDataUrl: null });
+        applySharedStream(stream);
+      }
     } catch (e) {
       setLastError(e instanceof Error ? e.message : "Failed to start screen share");
     }
   }
 
   function stopScreenShare() {
+    setShareSourceOptions(null);
     setScreenOn(false);
     meshRef.current?.setLocalScreenMedia(null);
     localScreenStream?.getTracks().forEach((t) => t.stop());
@@ -1260,7 +1340,6 @@ export function App() {
                 </div>
               </div>
             ) : null}
-
             <div className="muted">
               You: <code>{displayName}</code>
             </div>
@@ -1353,6 +1432,41 @@ export function App() {
         outputVolume={outputVolume}
         setOutputVolume={setOutputVolume}
       />
+
+      {shareSourceOptions && shareSourceOptions.length > 0 ? (
+        <div className="overlay" onClick={() => setShareSourceOptions(null)}>
+          <div className="modal sharePickerModal" onClick={(e) => e.stopPropagation()}>
+            <div className="sharePickerHeader">
+              <div>
+                <div style={{ fontWeight: 800 }}>Choose what to share</div>
+                <div className="muted">System audio is shared when selecting a full screen source (if OS/browser permits).</div>
+              </div>
+              <button className="btn" onClick={() => setShareSourceOptions(null)}>
+                Cancel
+              </button>
+            </div>
+            <div className="sharePickerGrid">
+              {shareSourceOptions.map((source) => (
+                <button key={source.id} className="sharePickerCard" onClick={() => void startScreenShareWithSourceId(source)}>
+                  <div className="sharePickerPreviewWrap">
+                    {source.previewDataUrl ? (
+                      <img className="sharePickerPreview" src={source.previewDataUrl} alt={source.name} />
+                    ) : (
+                      <div className="sharePickerPreviewFallback">{source.kind === "window" ? "Window" : "Screen"}</div>
+                    )}
+                  </div>
+                  <div className="sharePickerMeta">
+                    <div className="sharePickerKind">{source.kind}</div>
+                    <div className="sharePickerName" title={source.name}>
+                      {source.name}
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
