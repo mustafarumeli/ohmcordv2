@@ -336,10 +336,18 @@ select {
   display: grid;
   gap: 8px;
 }
-.chatAttachmentPreviewLink {
+.chatAttachments {
+  display: grid;
+  gap: 8px;
+}
+.chatAttachmentPreviewBtn {
   display: inline-grid;
   justify-self: start;
   max-width: min(360px, 100%);
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: zoom-in;
 }
 .chatAttachmentImage {
   max-width: 100%;
@@ -456,6 +464,12 @@ select {
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.03);
   padding: 6px 8px;
+}
+.chatComposerAttachments {
+  display: grid;
+  gap: 8px;
+  max-height: 140px;
+  overflow: auto;
 }
 .chatComposerAttachmentMeta {
   min-width: 0;

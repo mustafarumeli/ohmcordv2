@@ -13,6 +13,9 @@ import {
   type QueryDocumentSnapshot,
   type Timestamp
 } from "firebase/firestore";
+import Lightbox from "yet-another-react-lightbox";
+import Zoom from "yet-another-react-lightbox/plugins/zoom";
+import "yet-another-react-lightbox/styles.css";
 import { getFirebaseDb } from "../firebase";
 
 type ChatAttachment = {
@@ -30,10 +33,11 @@ type ChatMessage = {
   fromName: string;
   ts: number;
   message: string;
-  attachment?: ChatAttachment;
+  attachments: ChatAttachment[];
 };
 
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const UPLOAD_TIMEOUT_MS = 45_000;
 
 function tsToMs(ts: unknown): number {
   if (typeof ts === "number") return ts;
@@ -87,9 +91,24 @@ function parseAttachment(input: unknown): ChatAttachment | undefined {
   return { fileId, url, name, size, mimeType, kind };
 }
 
+function parseAttachments(input: unknown, fallback?: unknown): ChatAttachment[] {
+  const arr: ChatAttachment[] = [];
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      const parsed = parseAttachment(item);
+      if (parsed) arr.push(parsed);
+    }
+  }
+  if (arr.length === 0) {
+    const single = parseAttachment(fallback);
+    if (single) arr.push(single);
+  }
+  return arr;
+}
+
 function parseMessageDoc(
   id: string,
-  data: { uid?: string; fromName?: string; message?: string; ts?: unknown; attachment?: unknown }
+  data: { uid?: string; fromName?: string; message?: string; ts?: unknown; attachment?: unknown; attachments?: unknown }
 ): ChatMessage {
   return {
     id,
@@ -97,7 +116,7 @@ function parseMessageDoc(
     fromName: data.fromName ?? "Unknown",
     message: data.message ?? "",
     ts: tsToMs(data.ts),
-    attachment: parseAttachment(data.attachment)
+    attachments: parseAttachments(data.attachments, data.attachment)
   };
 }
 
@@ -115,7 +134,9 @@ export function ChatPanel(props: {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasMore, setHasMore] = useState(true);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [lightboxSlides, setLightboxSlides] = useState<Array<{ src: string; alt: string }>>([]);
+  const [lightboxIndex, setLightboxIndex] = useState<number>(-1);
   const [sending, setSending] = useState(false);
   const uploadApiBase = useMemo(() => resolveUploadApiBase(), []);
 
@@ -211,7 +232,9 @@ export function ChatPanel(props: {
     setHasMore(true);
     loadingOlderRef.current = false;
     setLoadingOlder(false);
-    setSelectedFile(null);
+    setSelectedFiles([]);
+    setLightboxSlides([]);
+    setLightboxIndex(-1);
     setSending(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
     lastCountRef.current = 0;
@@ -292,10 +315,24 @@ export function ChatPanel(props: {
     form.append("file", file);
     if (props.channelId) form.append("channelId", props.channelId);
 
-    const res = await fetch(`${uploadApiBase}/api/upload`, {
-      method: "POST",
-      body: form
-    });
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
+
+    let res: Response;
+    try {
+      res = await fetch(`${uploadApiBase}/api/upload`, {
+        method: "POST",
+        body: form,
+        signal: controller.signal
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw new Error("Upload timed out. Please try again.");
+      }
+      throw new Error("Upload request failed. Check server/proxy.");
+    } finally {
+      window.clearTimeout(timeout);
+    }
 
     let body: unknown = null;
     try {
@@ -321,18 +358,21 @@ export function ChatPanel(props: {
   async function sendMessage() {
     if (!canUse) return;
     const text = draft.trim();
-    if (!text && !selectedFile) return;
+    if (!text && selectedFiles.length === 0) return;
     if (sending) return;
     setSending(true);
     try {
-      let attachment: ChatAttachment | undefined;
-      if (selectedFile) attachment = await uploadFile(selectedFile);
+      const attachments: ChatAttachment[] = [];
+      for (const file of selectedFiles) {
+        attachments.push(await uploadFile(file));
+      }
       const db = getFirebaseDb();
       const payload: {
         uid: string | null;
         fromName: string;
         message: string;
         ts: ReturnType<typeof serverTimestamp>;
+        attachments?: ChatAttachment[];
         attachment?: ChatAttachment;
       } = {
         uid: props.uid,
@@ -340,10 +380,13 @@ export function ChatPanel(props: {
         message: text,
         ts: serverTimestamp()
       };
-      if (attachment) payload.attachment = attachment;
+      if (attachments.length > 0) {
+        payload.attachments = attachments;
+        payload.attachment = attachments[0];
+      }
       await addDoc(collection(db, "channels", props.channelId!, "messages"), payload);
       setDraft("");
-      setSelectedFile(null);
+      setSelectedFiles([]);
       if (fileInputRef.current) fileInputRef.current.value = "";
       props.onSentMessage?.();
     } catch (e) {
@@ -353,17 +396,38 @@ export function ChatPanel(props: {
     }
   }
 
-  function pickFile(file: File | null) {
-    if (!file) return;
-    if (file.size > MAX_UPLOAD_BYTES) {
-      props.onError?.("File is too large. Max allowed size is 50MB.");
-      return;
+  function pickFiles(files: readonly File[] | FileList | null) {
+    if (!files || files.length === 0) return;
+    const next: File[] = [];
+    for (const file of Array.from(files)) {
+      if (file.size > MAX_UPLOAD_BYTES) {
+        props.onError?.(`"${file.name}" is too large. Max allowed size is 50MB.`);
+        continue;
+      }
+      next.push(file);
     }
-    setSelectedFile(file);
+    if (next.length === 0) return;
+    setSelectedFiles((prev) => {
+      const merged = [...prev];
+      for (const file of next) {
+        const exists = merged.some((x) => x.name === file.name && x.size === file.size && x.lastModified === file.lastModified);
+        if (!exists) merged.push(file);
+      }
+      return merged;
+    });
   }
 
   function hasFilesInDrag(e: React.DragEvent): boolean {
     return Array.from(e.dataTransfer.types).includes("Files");
+  }
+
+  function openLightboxFromMessage(message: ChatMessage, clickedFileId: string) {
+    const imageAttachments = message.attachments.filter((a) => a.kind === "image");
+    if (imageAttachments.length === 0) return;
+    const slides = imageAttachments.map((a) => ({ src: a.url, alt: a.name }));
+    const idx = imageAttachments.findIndex((a) => a.fileId === clickedFileId);
+    setLightboxSlides(slides);
+    setLightboxIndex(idx >= 0 ? idx : 0);
   }
 
   return (
@@ -399,7 +463,7 @@ export function ChatPanel(props: {
           e.preventDefault();
           dragDepthRef.current = 0;
           setDragActive(false);
-          pickFile(e.dataTransfer.files?.[0] ?? null);
+          pickFiles(e.dataTransfer.files);
         }}
       >
         {dragActive ? <div className="chatDropHint">Drop file to attach</div> : null}
@@ -436,19 +500,27 @@ export function ChatPanel(props: {
                 </div>
                 <div className="chatMsgBubble">
                   {m.message ? <div className="chatMsgText">{m.message}</div> : null}
-                  {m.attachment ? (
-                    <div className="chatAttachment">
-                      {m.attachment.kind === "image" ? (
-                        <a href={m.attachment.url} target="_blank" rel="noreferrer" className="chatAttachmentPreviewLink">
-                          <img className="chatAttachmentImage" src={m.attachment.url} alt={m.attachment.name} loading="lazy" />
-                        </a>
-                      ) : null}
-                      <a className="chatAttachmentMeta" href={m.attachment.url} target="_blank" rel="noreferrer">
-                        <span className="chatAttachmentName">{m.attachment.name}</span>
-                        <span className="chatAttachmentInfo">
-                          {formatBytes(m.attachment.size)} · {m.attachment.mimeType}
-                        </span>
-                      </a>
+                  {m.attachments.length > 0 ? (
+                    <div className="chatAttachments">
+                      {m.attachments.map((attachment) => (
+                        <div className="chatAttachment" key={`${m.id}-${attachment.fileId}`}>
+                          {attachment.kind === "image" ? (
+                            <button
+                              type="button"
+                              className="chatAttachmentPreviewBtn"
+                              onClick={() => openLightboxFromMessage(m, attachment.fileId)}
+                            >
+                              <img className="chatAttachmentImage" src={attachment.url} alt={attachment.name} loading="lazy" />
+                            </button>
+                          ) : null}
+                          <a className="chatAttachmentMeta" href={attachment.url} target="_blank" rel="noreferrer">
+                            <span className="chatAttachmentName">{attachment.name}</span>
+                            <span className="chatAttachmentInfo">
+                              {formatBytes(attachment.size)} · {attachment.mimeType}
+                            </span>
+                          </a>
+                        </div>
+                      ))}
                     </div>
                   ) : null}
                 </div>
@@ -461,23 +533,35 @@ export function ChatPanel(props: {
           <input
             ref={fileInputRef}
             type="file"
+            multiple
             style={{ display: "none" }}
             onChange={(e) => {
-              const picked = e.target.files?.[0] ?? null;
-              pickFile(picked);
+              pickFiles(e.target.files);
               e.currentTarget.value = "";
             }}
             disabled={!canUse || sending}
           />
-          {selectedFile ? (
-            <div className="chatComposerAttachment">
-              <div className="chatComposerAttachmentMeta">
-                <span className="chatComposerAttachmentName">{selectedFile.name}</span>
-                <span className="chatComposerAttachmentInfo">{formatBytes(selectedFile.size)}</span>
-              </div>
-              <button className="btn" onClick={() => setSelectedFile(null)} disabled={sending}>
-                Remove
-              </button>
+          {selectedFiles.length > 0 ? (
+            <div className="chatComposerAttachments">
+              {selectedFiles.map((file) => (
+                <div className="chatComposerAttachment" key={`${file.name}-${file.lastModified}-${file.size}`}>
+                  <div className="chatComposerAttachmentMeta">
+                    <span className="chatComposerAttachmentName">{file.name}</span>
+                    <span className="chatComposerAttachmentInfo">{formatBytes(file.size)}</span>
+                  </div>
+                  <button
+                    className="btn"
+                    onClick={() =>
+                      setSelectedFiles((prev) =>
+                        prev.filter((x) => !(x.name === file.name && x.size === file.size && x.lastModified === file.lastModified))
+                      )
+                    }
+                    disabled={sending}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
             </div>
           ) : null}
           <div className="chatComposerRow">
@@ -510,6 +594,14 @@ export function ChatPanel(props: {
           {!uploadApiBase ? <div className="muted">File upload is disabled until VITE_UPLOAD_API_BASE is set.</div> : null}
         </div>
       </div>
+      <Lightbox
+        open={lightboxIndex >= 0}
+        close={() => setLightboxIndex(-1)}
+        slides={lightboxSlides}
+        index={Math.max(0, lightboxIndex)}
+        controller={{ closeOnBackdropClick: true }}
+        plugins={[Zoom]}
+      />
     </div>
   );
 }
